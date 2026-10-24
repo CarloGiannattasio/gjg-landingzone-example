@@ -1,6 +1,6 @@
 variable "name" {
   type        = string
-  description = "Name prefix for the VPC network, subnets, Cloud Routers, and Cloud NAT."
+  description = "Name prefix for the VPC network, firewall, subnets, Cloud Routers, and Cloud NAT."
 }
 
 variable "tshirt_size" {
@@ -30,7 +30,7 @@ variable "region" {
 
 variable "project_id" {
   type        = string
-  description = "GCP project ID that owns the VPC network, subnets, Cloud Routers, and Cloud NAT."
+  description = "GCP project ID that owns the VPC network, firewall, subnets, Cloud Routers, and Cloud NAT."
 }
 
 variable "enable_flow_logs" {
