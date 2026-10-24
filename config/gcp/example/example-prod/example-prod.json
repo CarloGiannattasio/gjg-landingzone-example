@@ -16,6 +16,7 @@
   "vpc": {
     "name": "example-prod-vpc",
     "cidr_block": "10.50.0.0/16",
-    "tshirt_size": "Large"
+    "tshirt_size": "Large",
+    "enable_flow_logs": true
   }
 }

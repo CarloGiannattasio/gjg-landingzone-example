@@ -8,13 +8,19 @@ variable "config_path" {
 }
 
 variable "gcp_config_path" {
-  description = "Path to one GCP project JSON file, relative to the root module directory. Decoded to prove the multi-cloud config contract. No GCP resources are created."
+  description = "Path to one GCP project JSON file, relative to the root module directory. The Google provider and VPC module read this file."
   type        = string
   default     = "../config/gcp/example/example-prod/example-prod.json"
 }
 
 variable "aws_endpoint_url" {
   description = "Base URL of one Moto server for every AWS service this stack calls. Null keeps the real AWS provider: no custom endpoints and no static keys. Set only for a local mock plan."
+  type        = string
+  default     = null
+}
+
+variable "gcp_endpoint_url" {
+  description = "Base URL of one local Google API mock for every GCP service this stack calls. Null keeps the real Google provider: no custom endpoint and no static keys. Set only for a local mock plan."
   type        = string
   default     = null
 }

@@ -4,7 +4,8 @@
 # endpoints block exist only in that case, so an unset variable does not
 # point the provider at localhost.
 locals {
-  moto_endpoint = var.aws_endpoint_url
+  moto_endpoint     = var.aws_endpoint_url
+  gcp_mock_endpoint = var.gcp_endpoint_url
 }
 
 provider "aws" {
@@ -33,4 +34,22 @@ provider "aws" {
       kms  = endpoints.value
     }
   }
+}
+
+# Real GCP when gcp_endpoint_url is null: project and region come from the
+# project JSON, and credentials come from the environment (Application Default
+# Credentials or GOOGLE_APPLICATION_CREDENTIALS in CI). A non-null URL is the
+# local mock plan path. The dummy access token and compute_custom_endpoint
+# exist only in that case, so an unset variable does not point Compute at the mock.
+provider "google" {
+  project = local.gcp_config.project_id
+  region  = local.gcp_config.region
+
+  access_token = local.gcp_mock_endpoint != null ? "testing" : null
+
+  # hashicorp/google has no single API host. compute_custom_endpoint replaces
+  # the Compute base URL for networks, subnets, routers, and Cloud NAT.
+  # Provider init still calls the Google userinfo endpoint on googleapis.com
+  # and continues if that request fails. This field does not redirect that call.
+  compute_custom_endpoint = local.gcp_mock_endpoint != null ? local.gcp_mock_endpoint : null
 }

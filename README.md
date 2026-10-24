@@ -1,6 +1,6 @@
 # gjg-landingzone-example
 
-Enterprise-style multi-cloud landing zone **example** for business unit `example`. One JSON document per account or project is the contract. The Terraform root module decodes that document and calls shared AWS modules. Terraform `>= 1.5` (CI pins `1.9.8`). GitHub Actions runs fmt, TFLint, Checkov, a config-contract check, a Moto plan of nonprod, `terraform test`, and a real-account plan for each AWS config when repository secrets are set. Pull requests get those plans as sticky comments.
+Enterprise-style multi-cloud landing zone **example** for business unit `example`. One JSON document per account or project is the contract. The Terraform root module decodes those documents and calls shared AWS and GCP modules. Terraform `>= 1.5` (CI pins `1.9.8`). GitHub Actions runs fmt, TFLint, Checkov, a config-contract check, a Moto plan of nonprod, a credential-free GCP mock plan, `terraform test`, a real-account AWS plan when AWS secrets are set, and a real GCP plan of root when both GCP and AWS plan secrets are set. Pull requests get those plans as sticky comments.
 
 The pipeline is **plan-only**. `terraform apply` is commented out in the workflow and cannot run.
 
@@ -13,6 +13,7 @@ The pipeline is **plan-only**. `terraform apply` is commented out in the workflo
 ├── .tflint.hcl
 ├── requirements-dev.txt
 ├── scripts/plan-with-c7n-moto.sh
+├── scripts/plan-with-gcp-mock.sh
 ├── config/
 │   ├── aws/example/example-prod/example-prod.json
 │   ├── aws/example/example-nonprod/example-nonprod.json
@@ -20,7 +21,8 @@ The pipeline is **plan-only**. `terraform apply` is commented out in the workflo
 │   └── gcp/example/example-prod/example-prod.json
 ├── modules/
 │   ├── aws-iam-role/
-│   └── aws-vpc-tshirt/
+│   ├── aws-vpc-tshirt/
+│   └── gcp-vpc-tshirt/
 ├── policies/
 │   ├── iam-permissions/example-admin-policy.json
 │   └── iam-trust/pipeline-trust.json
@@ -31,20 +33,24 @@ The pipeline is **plan-only**. `terraform apply` is commented out in the workflo
 │   ├── variables.tf
 │   └── versions.tf
 ├── tests/vpc_tshirt.tftest.hcl
+├── tests/gcp_vpc_tshirt.tftest.hcl
 └── tests.tf
 ```
 
 | Path | Role |
 | --- | --- |
 | `config/aws/example/*` | Account files for prod, nonprod, and preprod. `config_path` selects one of them. |
-| `config/gcp/example/example-prod` | GCP project file. Decoded and exported. No GCP resources are created. |
+| `config/gcp/example/example-prod` | GCP project file. `gcp_config_path` selects it. |
 | `modules/aws-vpc-tshirt` | VPC, subnets, and NAT from a T-shirt size. Removes the default VPC. |
+| `modules/gcp-vpc-tshirt` | Custom-mode VPC, subnets, Cloud Router, and Cloud NAT from a T-shirt size. Does not delete the GCP default network. |
 | `modules/aws-iam-role` | Role plus customer managed policy. Both documents are loaded with `file()`. |
 | `policies/` | Trust and permissions JSON, separate from the module source. |
 | `root/` | Composition root. No remote backend; state stays local for this example. |
 | `tests/vpc_tshirt.tftest.hcl` | `terraform test` with a mocked AWS provider. |
-| `tests.tf` | Root configuration with no resources, so `terraform init` installs the module under test. |
-| `scripts/plan-with-c7n-moto.sh` | Local `terraform plan` against Cloud Custodian's pinned Moto. |
+| `tests/gcp_vpc_tshirt.tftest.hcl` | `terraform test` with a mocked Google provider. |
+| `tests.tf` | Root configuration with no resources, so `terraform init` installs the modules under test. |
+| `scripts/plan-with-c7n-moto.sh` | Local `terraform plan` against Moto and a loopback Compute stub. |
+| `scripts/plan-with-gcp-mock.sh` | Same plan. Dummy AWS and GCP credentials. Compute is loopback; provider init still calls Google userinfo. |
 | `requirements-dev.txt` | Pins that Moto release (`moto[server]==5.2.3`). |
 
 Every `config/**/*.json` file carries `account_name` or `project_id`, plus `environment`, `business_unit`, `region`, `cost_center`, `mandatory_tags`, and `vpc`. AWS files use `account_name`. The GCP file uses `project_id` (and also sets `account_name`). CI rejects a file that drops any of those keys.
@@ -65,9 +71,13 @@ The root module then:
 - Checks the AWS business unit is `example`, the environment is `prod`, `nonprod`, or `preprod`, and `vpc.tshirt_size` is `Small`, `Medium`, or `Large`.
 - Calls `modules/aws-vpc-tshirt` with the VPC name, size, CIDR, default-VPC deletion flag, flow-log flag, and `mandatory_tags`.
 - Calls `modules/aws-iam-role` once per `iam_roles` entry. Trust and permission filenames in the JSON are resolved under `policies/iam-trust/` and `policies/iam-permissions/`.
-- Exports the decoded GCP `project_id` and `environment` (`gcp_project_id`, `gcp_environment`). The Google provider is not configured. This example has no GCP module, so the GCP document is data only.
+- Checks the GCP file has `account_name` or `project_name`, `project_id`, `environment`, `business_unit`, `region`, `cost_center`, `mandatory_tags`, and `vpc.name`, `vpc.cidr_block`, and `vpc.tshirt_size`.
+- Calls `modules/gcp-vpc-tshirt` with the network name, size, CIDR, region, project, and flow-log flag. `mandatory_tags` stays on the JSON contract. These Compute resources do not accept labels in hashicorp/google 8.8.1.
+- Exports the decoded GCP `project_id` and `environment` (`gcp_project_id`, `gcp_environment`) and the network outputs.
 
 The AWS provider region and default tags come from the selected account file. CI authenticates with GitHub OIDC when a real-account secret is set. The provider block does not contain keys unless `aws_endpoint_url` is set for a Moto plan, and then the keys are the dummy pair `testing` / `testing` sent only to that URL.
+
+The Google provider project and region come from the GCP file. Credentials come from the environment when `gcp_endpoint_url` is null. A non-null URL sets the dummy access token `testing` and `compute_custom_endpoint` to that URL. `hashicorp/google` has no single API host; that field covers the Compute resources in the VPC module (network, subnets, router, Cloud NAT).
 
 ## T-shirt sizes
 
@@ -81,6 +91,8 @@ The AWS provider region and default tags come from the selected account file. CI
 
 Flow logs are enabled for prod and preprod (`enable_flow_logs: true`). Nonprod leaves them disabled. Every AWS account file sets `delete_default_vpc: true`.
 
+`modules/gcp-vpc-tshirt` uses the same sizes. Small is one zone and one Cloud NAT, Medium is two zones and one shared Cloud NAT, and Large is three zones and one Cloud NAT per zone. The example GCP project is Large (`10.50.0.0/16`, flow logs on). The module does not delete the GCP default network and does not open `0.0.0.0/0`.
+
 ## IAM documents
 
 Policies stay out of the module as JSON so a reviewer can read them without the HCL. `modules/aws-iam-role` loads them with `file(var.trust_policy_path)` and `file(var.permission_policy_path)` and attaches the customer managed policy to the role.
@@ -91,7 +103,7 @@ Policies stay out of the module as JSON so a reviewer can read them without the 
 
 ## Plan locally
 
-From the repo root, with AWS credentials available to the process that runs Terraform:
+From the repo root, with AWS and GCP credentials available to the process that runs Terraform (a plan of root talks to both providers):
 
 ```bash
 terraform -chdir=root init -backend=false
@@ -100,7 +112,7 @@ terraform -chdir=root plan -var='config_path=../config/aws/example/example-prod/
 
 Swap the path for `example-nonprod` or `example-preprod` to plan those accounts. `init -backend=false` matches this example: `root/versions.tf` has no backend block.
 
-`terraform plan` refreshes AWS. It does not apply. There is no apply command in the local flow above.
+`terraform plan` refreshes AWS and GCP. It does not apply. There is no apply command in the local flow above. `gcp_config_path` defaults to the example GCP project file.
 
 ## Plan against Cloud Custodian's Moto
 
@@ -112,9 +124,11 @@ This is not a substitute for the OIDC plan against real AWS. `tests/vpc_tshirt.t
 ./scripts/plan-with-c7n-moto.sh
 ```
 
-The script plans `config/aws/example/example-nonprod/example-nonprod.json` (Small, flow logs off). Pass another config path, relative to the `root` module, as the first argument. It does not apply. With `aws_endpoint_url` unset, the provider stays on real AWS.
+The script plans `config/aws/example/example-nonprod/example-nonprod.json` (Small, flow logs off) and the default GCP project file. Pass another AWS config path, relative to the `root` module, as the first argument. It does not apply. It sets `aws_endpoint_url` and `gcp_endpoint_url`. With both unset, the providers stay on real AWS and real Google.
 
-A plan of the nonprod config against this server succeeded: 16 to add, 0 to change, 0 to destroy. Moto answered EC2 `DescribeAvailabilityZones` (`us-east-1a`). The plan includes the VPC, public and private subnets, the default security group with no rules, internet gateway, route tables and associations, NAT EIP, NAT gateway, default VPC adoption (`aws_default_vpc`), the `example-admin` IAM role, its customer managed policy, and the attachment. Flow logs and CloudWatch Logs are not in that plan because nonprod sets `enable_flow_logs` to false. Plan does not call the create APIs, and this repo does not apply, so default-VPC adoption was not executed against Moto. No resource was removed from the real-AWS path.
+`./scripts/plan-with-gcp-mock.sh` runs that same plan. It does not need real Google or AWS credentials.
+
+A plan of the nonprod config against Moto and the loopback Compute stub succeeded: 29 to add, 0 to change, 0 to destroy. Moto answered EC2 `DescribeAvailabilityZones` (`us-east-1a`). The plan includes the AWS VPC, subnets, NAT, default VPC adoption, and the `example-admin` role, plus the GCP network, subnets, Cloud Routers, and Cloud NAT from the example project (Large). Provider init still requests Google userinfo on googleapis.com and continues after a 401 for the dummy token. No Compute request was sent to compute.googleapis.com or to the stub on that empty-state plan. The script does not apply.
 
 ## Real account
 
@@ -125,6 +139,14 @@ To point `terraform-plan` at a real account later, add secrets in the GitHub rep
 - Optional: `AWS_REGION`. When that secret is unset, the credentials step uses `us-east-1`.
 
 If `AWS_PLAN_ROLE_ARN` is set, the job uses OIDC. Otherwise, if both access key secrets are set, the job uses those static keys. If neither is configured, the real-account plan job is skipped and the Moto plan job still runs.
+
+The real GCP plan (`terraform-plan (real GCP)`) runs only when both sets of credentials are present, because that plan talks to AWS and GCP:
+
+- Preferred: `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT` (Workload Identity Federation).
+- Or, if you choose a key instead: `GCP_SA_KEY`.
+- And the AWS plan secrets above (`AWS_PLAN_ROLE_ARN`, or both access key secrets).
+
+If only one side is set, the real GCP job is skipped. The pull request comment says which side was missing. Secret values are not printed. The mock plan does not read these secrets.
 
 The account id `123456789012` in `policies/iam-trust/pipeline-trust.json` is a placeholder in the example trust policy. It is unrelated to these secrets and is still not a live account.
 
@@ -137,7 +159,7 @@ terraform init -backend=false
 terraform test
 ```
 
-`terraform init` installs the module the test file references. `tests.tf` declares no resources; Terraform 1.9 needs that file to load the test. A directory with only `.tftest.hcl` files is treated as empty and skips the install. `tests/vpc_tshirt.tftest.hcl` mocks the AWS provider, so the test does not need credentials or a cloud account.
+`terraform init` installs the module the test file references. `tests.tf` declares no resources; Terraform 1.9 needs that file to load the test. A directory with only `.tftest.hcl` files is treated as empty and skips the install. `tests/vpc_tshirt.tftest.hcl` mocks the AWS provider and `tests/gcp_vpc_tshirt.tftest.hcl` mocks the Google provider, so the tests do not need credentials or a cloud account.
 
 ## Pipeline
 
@@ -145,20 +167,24 @@ Workflow: `.github/workflows/landing-zone-pipeline.yml` (`Landing Zone Pipeline`
 
 Triggers: push to `main`, pull requests targeting `main`, and manual `workflow_dispatch`.
 
-Permissions at the workflow level are `contents: read` and `id-token: write`. The workflow does not request write-all, and it does not store static AWS keys. `terraform-plan-moto` sets `contents: read` and `pull-requests: write` so that job can comment its plan on pull requests. `comment-plans` uses those same two permissions for the real-account comment and does not check out the pull request.
+Permissions at the workflow level are `contents: read` and `id-token: write`. The workflow does not request write-all, and it does not store static AWS or GCP keys. `terraform-plan-moto` and `terraform-plan-gcp-mock` set `contents: read` and `pull-requests: write` so those jobs can comment their plans on pull requests. `comment-plans` and `comment-gcp-plan` use those same two permissions for the real-account comments and do not check out the pull request.
 
 | Job | What it does | AWS credentials |
 | --- | --- | --- |
 | `lint-and-scan` | `terraform fmt -check -recursive`, `tflint --init` and `tflint --recursive`, Checkov (`framework: terraform`) on `modules/` and `root/`, then a Python check that every `config/**/*.json` has the contract keys (AWS and GCP). | None |
 | `aws-credentials-present` | Checks whether real-account secrets are set. Prints `oidc`, `static`, or `unset`. Does not print secret values. | Reads secret names only |
-| `terraform-plan (real AWS account)` | Skipped when neither `AWS_PLAN_ROLE_ARN` nor both access key secrets are set. Otherwise a matrix of the three AWS account files. Working directory `root`. `terraform init -backend=false`, `terraform validate`, `terraform plan -var=config_path=... -out=tfplan`. OIDC when the role secret is set; static keys only when the role secret is empty and both key secrets are set. | OIDC role, or the two key secrets |
-| `terraform-plan-moto` | `./scripts/plan-with-c7n-moto.sh` for the nonprod config. No apply. On pull requests, posts or updates one sticky comment (`<!-- landing-zone-plan -->`) with the plan summary and the plan text. | None |
+| `terraform-plan (real AWS account)` | Skipped when neither `AWS_PLAN_ROLE_ARN` nor both access key secrets are set. Otherwise a matrix of the three AWS account files. Working directory `root`. `terraform init -backend=false`, `terraform validate`, `terraform plan -var=config_path=... -out=tfplan`. OIDC when the role secret is set; static keys only when the role secret is empty and both key secrets are set. Also authenticates to GCP when those secrets are set, because root plans GCP resources too. | OIDC role, or the two key secrets. GCP auth when configured |
+| `gcp-credentials-present` | Checks GCP and AWS plan secrets. Prints `wif`, `sa_key`, or `unset` for GCP and `oidc`, `static`, or `unset` for AWS. Does not print secret values. | Reads secret names only |
+| `terraform-plan (real GCP)` | Skipped unless GCP credentials (`GCP_WORKLOAD_IDENTITY_PROVIDER` + `GCP_SERVICE_ACCOUNT`, or `GCP_SA_KEY`) and AWS plan credentials are both set. Plans `root` for example-prod. No apply. | Both GCP and AWS plan credentials |
+| `terraform-plan-moto` | `./scripts/plan-with-c7n-moto.sh` for the nonprod config, with Moto and a loopback Compute URL. No apply. On pull requests, posts or updates one sticky comment (`<!-- landing-zone-plan -->`). | None |
+| `terraform-plan-gcp-mock` | `./scripts/plan-with-gcp-mock.sh`. Same mock plan. On pull requests, posts or updates `<!-- landing-zone-plan-gcp-mock -->`. | None |
 | `terraform-test` | `terraform init -backend=false`, then `terraform test` from the repo root. | None |
 | `comment-plans` | Pull requests only. Posts or updates the real-account sticky comment (`<!-- landing-zone-plan-real -->`). Says the real plan was skipped when AWS secrets are unset. Does not check out code. | None |
+| `comment-gcp-plan` | Pull requests only. Posts or updates `<!-- landing-zone-plan-gcp -->` with the real GCP plan, or a note that it was skipped and which credential set was missing. Does not check out code. | None |
 
-`terraform apply -input=false tfplan` is present only as a YAML comment on the plan job. GitHub Actions does not parse it, so apply is not a step and cannot run. Promoting a plan to apply would be a separate, reviewed change.
+`terraform apply -input=false tfplan` is present only as a YAML comment on the real AWS plan job and the real GCP plan job. GitHub Actions does not parse it, so apply is not a step and cannot run. Promoting a plan to apply would be a separate, reviewed change.
 
-On a pull request, `terraform-plan-moto` updates `<!-- landing-zone-plan -->` with the Moto plan for nonprod. The comment states that the run does not use AWS credentials and is not a live apply. The plan summary line (for example `Plan: N to add`) is visible, and the plan text is in a collapsed details block, truncated near 60k characters. `comment-plans` updates `<!-- landing-zone-plan-real -->` with the real-account plan, or a note that the real-account plan was skipped when AWS secrets are unset. Secret values are not printed. Pushes to `main` and manual `workflow_dispatch` runs do not comment, because those events are not pull requests.
+On a pull request, `terraform-plan-moto` updates `<!-- landing-zone-plan -->` with the Moto plan for nonprod. `terraform-plan-gcp-mock` updates `<!-- landing-zone-plan-gcp-mock -->` with the mock plan. Those comments state that the run does not use cloud credentials and is not a live apply. The plan summary line (for example `Plan: N to add`) is visible, and the plan text is in a collapsed details block, truncated near 60k characters. `comment-plans` updates `<!-- landing-zone-plan-real -->`. `comment-gcp-plan` updates `<!-- landing-zone-plan-gcp -->` with the real plan, or a note that it was skipped. Secret values are not printed. Pushes to `main` and manual `workflow_dispatch` runs do not comment, because those events are not pull requests.
 
 `.github/CODEOWNERS` names `@CarloGiannattasio` as the owner of every path. Merges to `main` are meant to require that code owner's approval, dismiss stale approvals, block force pushes and deletions, and require `lint-and-scan`, `terraform-test`, `terraform-plan-moto`, and `real-account credentials check`. `terraform-plan (real AWS account)` is not required, because that job is skipped when secrets are unset and a skipped required check would block merges. Admin bypass stays available so the code owner is not locked out of a pull request they opened. Everyone else still needs that code-owner approval.
 

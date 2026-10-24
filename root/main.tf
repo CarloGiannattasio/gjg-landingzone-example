@@ -1,9 +1,6 @@
 locals {
   aws_config = jsondecode(file(abspath("${path.module}/${var.config_path}")))
 
-  # GCP application modules are intentionally not in this example; the config
-  # is the landing-zone data contract. The Google provider is not configured
-  # and no GCP resources are created.
   gcp_config = jsondecode(file(abspath("${path.module}/${var.gcp_config_path}")))
 
   aws_environments = ["prod", "nonprod", "preprod"]
@@ -66,6 +63,17 @@ module "vpc" {
   delete_default_vpc = local.aws_config.vpc.delete_default_vpc
   enable_flow_logs   = local.aws_config.vpc.enable_flow_logs
   tags               = local.aws_config.mandatory_tags
+}
+
+module "gcp_vpc" {
+  source = "../modules/gcp-vpc-tshirt"
+
+  name             = local.gcp_config.vpc.name
+  tshirt_size      = local.gcp_config.vpc.tshirt_size
+  cidr_block       = local.gcp_config.vpc.cidr_block
+  region           = local.gcp_config.region
+  project_id       = local.gcp_config.project_id
+  enable_flow_logs = try(local.gcp_config.vpc.enable_flow_logs, false)
 }
 
 module "iam_roles" {

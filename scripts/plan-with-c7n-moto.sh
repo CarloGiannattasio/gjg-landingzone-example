@@ -26,6 +26,7 @@ fi
 "$ROOT/.venv/bin/python" -m pip install --disable-pip-version-check --quiet -r "$ROOT/requirements-dev.txt"
 
 PORT_FILE="$(mktemp)"
+GCP_PORT_FILE="$(mktemp)"
 LOG_FILE="$(mktemp)"
 
 cleanup() {
@@ -33,7 +34,11 @@ cleanup() {
     kill "$MOTO_PID" 2>/dev/null || true
     wait "$MOTO_PID" 2>/dev/null || true
   fi
-  rm -f "$PORT_FILE"
+  if [[ -n "${GCP_PID:-}" ]]; then
+    kill "$GCP_PID" 2>/dev/null || true
+    wait "$GCP_PID" 2>/dev/null || true
+  fi
+  rm -f "$PORT_FILE" "$GCP_PORT_FILE"
 }
 trap cleanup EXIT
 
@@ -107,10 +112,88 @@ print(f"127.0.0.1:{port} did not accept connections", file=sys.stderr)
 sys.exit(1)
 PY
 
-echo "Planning against Cloud Custodian's pinned Moto (${ENDPOINT})"
+# hashicorp/google has no single API host. compute_custom_endpoint is the
+# Compute base path, which covers the VPC module. Dummy token, loopback only.
+python3 - "$GCP_PORT_FILE" <<'PY' &
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+port_file = sys.argv[1]
+
+class Handler(BaseHTTPRequestHandler):
+    def _respond(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length:
+            self.rfile.read(length)
+        host = self.headers.get("Host", "")
+        print(f"gcp-stub {self.command} host={host} path={self.path}", flush=True)
+        if "googleapis.com" in host or "googleapis.com" in self.path:
+            print("gcp-stub saw googleapis.com; this is not a local mock", flush=True)
+            self.send_response(500)
+        else:
+            self.send_response(404)
+        body = json.dumps({"error": {"code": 404, "message": "notFound", "status": "NOT_FOUND"}}).encode()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._respond()
+
+    def do_POST(self):
+        self._respond()
+
+    def do_PUT(self):
+        self._respond()
+
+    def do_PATCH(self):
+        self._respond()
+
+    def do_DELETE(self):
+        self._respond()
+
+    def log_message(self, fmt, *args):
+        return
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file, "w", encoding="utf-8") as handle:
+    handle.write(str(server.server_address[1]))
+    handle.flush()
+print(f"gcp-stub listening 127.0.0.1:{server.server_address[1]}", flush=True)
+server.serve_forever()
+PY
+GCP_PID=$!
+
+for _ in $(seq 1 30); do
+  if [[ -s "$GCP_PORT_FILE" ]]; then
+    break
+  fi
+  if ! kill -0 "$GCP_PID" 2>/dev/null; then
+    echo "GCP stub exited before listening." >&2
+    exit 1
+  fi
+  sleep 0.2
+done
+
+if [[ ! -s "$GCP_PORT_FILE" ]]; then
+  echo "GCP stub did not report a port." >&2
+  exit 1
+fi
+
+GCP_PORT="$(cat "$GCP_PORT_FILE")"
+GCP_ENDPOINT="http://127.0.0.1:${GCP_PORT}/compute/v1/"
+
+# Do not let Application Default Credentials send this plan to Google.
+unset GOOGLE_APPLICATION_CREDENTIALS GOOGLE_CREDENTIALS GOOGLE_OAUTH_ACCESS_TOKEN \
+  GOOGLE_CLOUD_KEYFILE_JSON CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE
+
+echo "Planning against Cloud Custodian's pinned Moto (${ENDPOINT}) and loopback Compute (${GCP_ENDPOINT})"
 "$TF" -chdir=root init -backend=false -input=false -no-color
 "$TF" -chdir=root plan -input=false -no-color \
   -var="config_path=${CONFIG_PATH}" \
-  -var="aws_endpoint_url=${ENDPOINT}"
+  -var="aws_endpoint_url=${ENDPOINT}" \
+  -var="gcp_endpoint_url=${GCP_ENDPOINT}"
 
 rm -f "$LOG_FILE"
