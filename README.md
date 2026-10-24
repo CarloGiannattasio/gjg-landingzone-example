@@ -1,8 +1,12 @@
 # gjg-landingzone-example
 
-Enterprise-style multi-cloud landing zone **example** for business unit `example`. One JSON document per account or project is the contract. The Terraform root module decodes those documents and calls shared AWS and GCP modules. Terraform `>= 1.5` (CI pins `1.9.8`). GitHub Actions runs fmt, TFLint, Checkov, a config-contract check, a Moto plan of the same AWS account files as the real-credential plan, a credential-free GCP mock plan of the same GCP project list, `terraform test`, a real-account AWS plan when AWS secrets are set, and a real GCP plan of root when both GCP and AWS plan secrets are set. Pull requests get one sticky comment: a table of each plan, the account name, and the add, change, and destroy counts.
+[![Landing Zone Pipeline](https://github.com/CarloGiannattasio/gjg-landingzone-example/actions/workflows/landing-zone-pipeline.yml/badge.svg)](https://github.com/CarloGiannattasio/gjg-landingzone-example/actions/workflows/landing-zone-pipeline.yml)
 
-The pipeline is **plan-only**. `terraform apply` is commented out in the workflow and cannot run.
+One JSON file per AWS account or GCP project. The root module sizes each VPC Small, Medium, or Large.
+Plan-only pipeline: GitHub Actions signs in with OIDC, Checkov scans the Terraform, and mock plans run without cloud credentials.
+Each pull request gets one comment with the account name and the add, change, and destroy counts.
+
+`terraform apply` is commented out in the workflow and cannot run. Terraform `>= 1.5` (CI pins `1.9.8`).
 
 ## Layout
 
