@@ -1,6 +1,8 @@
 # Landing zone pipeline. Plan-only by default.
 # contents: read is enough to check out the repo.
 # id-token: write lets the plan job assume AWS_PLAN_ROLE_ARN with GitHub OIDC.
+# pull-requests: write is set only on the comment job. That job does not check out
+# the pull request, so untrusted code does not run with a token that can comment.
 # No static AWS access keys are stored in this workflow.
 name: Landing Zone Pipeline
 
@@ -197,7 +199,31 @@ jobs:
         run: terraform validate -no-color
 
       - name: Terraform plan
-        run: terraform plan -input=false -no-color -var="config_path=${{ matrix.config_path }}" -out=tfplan
+        run: |
+          set -o pipefail
+          base=$(basename "${{ matrix.config_path }}" .json)
+          mkdir -p "${GITHUB_WORKSPACE}/real-plans"
+          terraform plan -input=false -no-color -var="config_path=${{ matrix.config_path }}" -out=tfplan 2>&1 | tee "${GITHUB_WORKSPACE}/real-plans/${base}.txt"
+
+      - name: Ensure real-account plan file exists
+        if: always()
+        run: |
+          base=$(basename "${{ matrix.config_path }}" .json)
+          mkdir -p "${GITHUB_WORKSPACE}/real-plans"
+          file="${GITHUB_WORKSPACE}/real-plans/${base}.txt"
+          if [ ! -f "$file" ]; then
+            echo "Real-account plan produced no output for ${base}." > "$file"
+          fi
+
+      - name: Upload real-account plan
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: plan-real-${{ strategy.job-index }}
+          path: ${{ github.workspace }}/real-plans
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
       # SAFETY: live apply is intentionally disabled. This pipeline defaults to
       # plan-only execution. The block below is a YAML comment, so GitHub
@@ -229,7 +255,26 @@ jobs:
 
       # Nonprod config, Cloud Custodian's pinned Moto. No AWS secrets. No apply.
       - name: Terraform plan against Moto
-        run: ./scripts/plan-with-c7n-moto.sh
+        run: |
+          set -o pipefail
+          ./scripts/plan-with-c7n-moto.sh 2>&1 | tee "${GITHUB_WORKSPACE}/plan-moto.txt"
+
+      - name: Ensure Moto plan file exists
+        if: always()
+        run: |
+          if [ ! -f "${GITHUB_WORKSPACE}/plan-moto.txt" ]; then
+            echo "Moto plan produced no output." > "${GITHUB_WORKSPACE}/plan-moto.txt"
+          fi
+
+      - name: Upload Moto plan
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: plan-moto
+          path: plan-moto.txt
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
   terraform-test:
     name: terraform-test
@@ -255,3 +300,225 @@ jobs:
       - name: Terraform test
         working-directory: ${{ github.workspace }}
         run: terraform test
+
+  # Posts plan text captured by the plan jobs. No checkout: the pull request
+  # tree is not on disk, and this token cannot be used by that code.
+  comment-plans:
+    name: comment-plans
+    needs:
+      - aws-credentials-present
+      - terraform-plan
+      - terraform-plan-moto
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      needs.terraform-plan-moto.result != 'cancelled' &&
+      needs.aws-credentials-present.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download Moto plan
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: plan-moto
+          path: plans/moto
+
+      - name: Download real-account plans
+        if: always()
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: plan-real-*
+          path: plans/real
+
+      - name: Post or update sticky plan comments
+        if: always()
+        uses: actions/github-script@v9
+        env:
+          MOTO_RESULT: ${{ needs.terraform-plan-moto.result }}
+          REAL_RESULT: ${{ needs.terraform-plan.result }}
+          REAL_CONFIGURED: ${{ needs.aws-credentials-present.outputs.configured }}
+          REAL_MODE: ${{ needs.aws-credentials-present.outputs.mode }}
+          CREDENTIALS_RESULT: ${{ needs.aws-credentials-present.result }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            const MAX_PLAN = 60000;
+            const MAX_COMMENT = 65000;
+            const MOTO_MARKER = "<!-- landing-zone-plan -->";
+            const REAL_MARKER = "<!-- landing-zone-plan-real -->";
+
+            function redact(text) {
+              return String(text)
+                .replace(/\u0000/g, "")
+                .replace(/\b(AKIA|ASIA|AROA|AIDA)[0-9A-Z]{16}\b/g, "[redacted]")
+                .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
+                .replace(/\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
+                .replace(/(aws_secret_access_key|aws_access_key_id)\s*[:=]\s*\S+/gi, "$1=[redacted]");
+            }
+
+            function truncate(text, limit) {
+              if (text.length <= limit) return text;
+              const suffix = `\n… truncated to ${limit} characters`;
+              const keep = Math.max(0, limit - suffix.length);
+              return text.slice(0, keep) + suffix;
+            }
+
+            function escapeHtml(text) {
+              return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;");
+            }
+
+            function planHtml(body, limit) {
+              const clipped = truncate(redact(body), limit);
+              let escaped = escapeHtml(clipped);
+              if (escaped.length > limit) {
+                escaped = truncate(escaped, limit);
+              }
+              return escaped;
+            }
+
+            function detailsBlock(summary, body, limit) {
+              return [
+                "<details>",
+                `<summary>${escapeHtml(summary)}</summary>`,
+                "",
+                `<pre><code>${planHtml(body, limit)}</code></pre>`,
+                "</details>",
+              ].join("\n");
+            }
+
+            function walkTxt(dir, found) {
+              if (!fs.existsSync(dir)) return;
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) walkTxt(full, found);
+                else if (entry.isFile() && entry.name.endsWith(".txt")) found.push(full);
+              }
+            }
+
+            function sectionsUnder(dir) {
+              if (!fs.existsSync(dir)) return [];
+              const files = [];
+              walkTxt(dir, files);
+              files.sort();
+              return files.map((file) => {
+                const raw = fs.readFileSync(file, "utf8").slice(0, 80000);
+                return {
+                  summary: path.basename(file, ".txt"),
+                  body: raw.trim() ? raw : "(no output)",
+                };
+              });
+            }
+
+            function render(marker, header, sections) {
+              const wrapper = (summary) =>
+                `<details>\n<summary>${escapeHtml(summary)}</summary>\n\n<pre><code></code></pre>\n</details>\n\n`.length;
+              let overhead = marker.length + 1 + header.length + 2;
+              for (const section of sections) overhead += wrapper(section.summary);
+              const per =
+                sections.length === 0
+                  ? MAX_PLAN
+                  : Math.max(2000, Math.min(MAX_PLAN, Math.floor((MAX_COMMENT - overhead) / sections.length)));
+              const blocks = sections.map((section) => detailsBlock(section.summary, section.body, per));
+              let body = `${marker}\n${header}`;
+              if (blocks.length) body += `\n\n${blocks.join("\n\n")}`;
+              if (body.length > MAX_COMMENT && sections.length) {
+                const overflow = body.length - MAX_COMMENT;
+                const tighter = Math.max(500, per - Math.ceil(overflow / sections.length) - 80);
+                const again = sections.map((section) => detailsBlock(section.summary, section.body, tighter));
+                body = `${marker}\n${header}\n\n${again.join("\n\n")}`;
+              }
+              if (body.length > MAX_COMMENT) {
+                body = `${body.slice(0, MAX_COMMENT - 28)}\n… comment truncated`;
+              }
+              return body;
+            }
+
+            async function upsert(comments, marker, body) {
+              const existing = comments.find(
+                (comment) => typeof comment.body === "string" && comment.body.startsWith(marker)
+              );
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+                console.log(`Updated comment ${existing.id} for ${marker}`);
+                return;
+              }
+              const created = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+              comments.push(created.data);
+              console.log(`Created comment ${created.data.id} for ${marker}`);
+            }
+
+            const motoResult = process.env.MOTO_RESULT || "unknown";
+            const realResult = process.env.REAL_RESULT || "unknown";
+            const configured = process.env.REAL_CONFIGURED || "";
+            const mode = process.env.REAL_MODE || "";
+            const credentialsResult = process.env.CREDENTIALS_RESULT || "unknown";
+            const secretsUnset = configured === "false" || mode === "unset";
+            const realSkipped = realResult === "skipped";
+
+            const motoSections = sectionsUnder("plans/moto");
+            let motoHeader =
+              "## Terraform plan (Moto)\n\n" +
+              "Job `terraform-plan-moto` ran `./scripts/plan-with-c7n-moto.sh` " +
+              `(result: \`${motoResult}\`). This plan does not use AWS secrets.`;
+            if (motoSections.length === 0) {
+              motoHeader += "\n\nMoto plan output was not uploaded.";
+            }
+            if (realSkipped && secretsUnset) {
+              motoHeader += "\n\nReal-account plan was skipped because AWS plan secrets are unset.";
+            } else if (realSkipped) {
+              motoHeader += "\n\nReal-account plan was skipped.";
+            } else {
+              motoHeader += "\n\nThe real-account plan is in a separate comment.";
+            }
+
+            let realHeader = "## Terraform plan (real AWS account)\n\n";
+            let realSections = [];
+            if (realSkipped && secretsUnset) {
+              realHeader +=
+                "Real-account plan was skipped because AWS plan secrets are unset. " +
+                "Set `AWS_PLAN_ROLE_ARN`, or both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, " +
+                "in GitHub Actions secrets to run this plan. Secret values are not printed.";
+            } else if (realSkipped) {
+              realHeader +=
+                `Real-account plan was skipped (credentials check result: \`${credentialsResult}\`). ` +
+                "Secret values are not printed.";
+            } else {
+              realHeader +=
+                "Job `terraform-plan (real AWS account)` " +
+                `result: \`${realResult}\`. Credential mode: \`${mode || "unknown"}\`. ` +
+                "Secret values are not printed.";
+              realSections = sectionsUnder("plans/real");
+              if (realSections.length === 0) {
+                realHeader += "\n\nThe real-account plan job did not upload plan output.";
+              }
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+
+            await upsert(comments, MOTO_MARKER, render(MOTO_MARKER, motoHeader, motoSections));
+            await upsert(comments, REAL_MARKER, render(REAL_MARKER, realHeader, realSections));
