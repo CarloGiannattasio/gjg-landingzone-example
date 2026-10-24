@@ -143,22 +143,22 @@ terraform test
 
 Workflow: `.github/workflows/landing-zone-pipeline.yml` (`Landing Zone Pipeline`).
 
-Triggers: push to `main`, and pull requests targeting `main`.
+Triggers: push to `main`, pull requests targeting `main`, and manual `workflow_dispatch`.
 
-Permissions at the workflow level are `contents: read` and `id-token: write`. The workflow does not request write-all, and it does not store static AWS keys. The Moto job narrows itself to `contents: read`. The comment job replaces that set with `contents: read` and `pull-requests: write`, and it does not check out the pull request.
+Permissions at the workflow level are `contents: read` and `id-token: write`. The workflow does not request write-all, and it does not store static AWS keys. `terraform-plan-moto` sets `contents: read` and `pull-requests: write` so that job can comment its plan on pull requests. `comment-plans` uses those same two permissions for the real-account comment and does not check out the pull request.
 
 | Job | What it does | AWS credentials |
 | --- | --- | --- |
 | `lint-and-scan` | `terraform fmt -check -recursive`, `tflint --init` and `tflint --recursive`, Checkov (`framework: terraform`) on `modules/` and `root/`, then a Python check that every `config/**/*.json` has the contract keys (AWS and GCP). | None |
 | `aws-credentials-present` | Checks whether real-account secrets are set. Prints `oidc`, `static`, or `unset`. Does not print secret values. | Reads secret names only |
 | `terraform-plan (real AWS account)` | Skipped when neither `AWS_PLAN_ROLE_ARN` nor both access key secrets are set. Otherwise a matrix of the three AWS account files. Working directory `root`. `terraform init -backend=false`, `terraform validate`, `terraform plan -var=config_path=... -out=tfplan`. OIDC when the role secret is set; static keys only when the role secret is empty and both key secrets are set. | OIDC role, or the two key secrets |
-| `terraform-plan-moto` | `./scripts/plan-with-c7n-moto.sh` for the nonprod config. No apply. | None |
+| `terraform-plan-moto` | `./scripts/plan-with-c7n-moto.sh` for the nonprod config. No apply. On pull requests, posts or updates one sticky comment (`<!-- landing-zone-plan -->`) with the plan summary and the plan text. | None |
 | `terraform-test` | `terraform init -backend=false`, then `terraform test` from the repo root. | None |
-| `comment-plans` | Pull requests only. Updates two sticky comments instead of posting a new one on every push. Does not check out code; it reads plan artifacts from the jobs above. | None |
+| `comment-plans` | Pull requests only. Posts or updates the real-account sticky comment (`<!-- landing-zone-plan-real -->`). Says the real plan was skipped when AWS secrets are unset. Does not check out code. | None |
 
 `terraform apply -input=false tfplan` is present only as a YAML comment on the plan job. GitHub Actions does not parse it, so apply is not a step and cannot run. Promoting a plan to apply would be a separate, reviewed change.
 
-On a pull request, `<!-- landing-zone-plan -->` is the Moto plan (`terraform-plan-moto` / `./scripts/plan-with-c7n-moto.sh`). `<!-- landing-zone-plan-real -->` is the real-account plan, or a note that the real-account plan was skipped when AWS secrets are unset. Each plan is in a collapsed details block. Plan text is truncated so the comment stays under GitHub's size limit, and secret values are not printed.
+On a pull request, `terraform-plan-moto` updates `<!-- landing-zone-plan -->` with the Moto plan for nonprod. The comment states that the run does not use AWS credentials and is not a live apply. The plan summary line (for example `Plan: N to add`) is visible, and the plan text is in a collapsed details block, truncated near 60k characters. `comment-plans` updates `<!-- landing-zone-plan-real -->` with the real-account plan, or a note that the real-account plan was skipped when AWS secrets are unset. Secret values are not printed. Pushes to `main` and manual `workflow_dispatch` runs do not comment, because those events are not pull requests.
 
 `.github/CODEOWNERS` names `@CarloGiannattasio` as the owner of every path. Merges to `main` are meant to require that code owner's approval, dismiss stale approvals, block force pushes and deletions, and require `lint-and-scan`, `terraform-test`, `terraform-plan-moto`, and `real-account credentials check`. `terraform-plan (real AWS account)` is not required, because that job is skipped when secrets are unset and a skipped required check would block merges. Admin bypass stays available so the code owner is not locked out of a pull request they opened. Everyone else still needs that code-owner approval.
 

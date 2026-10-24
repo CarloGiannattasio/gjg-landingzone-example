@@ -108,7 +108,7 @@ sys.exit(1)
 PY
 
 echo "Planning against Cloud Custodian's pinned Moto (${ENDPOINT})"
-"$TF" -chdir=root init -backend=false -input=false
+"$TF" -chdir=root init -backend=false -input=false -no-color
 "$TF" -chdir=root plan -input=false -no-color \
   -var="config_path=${CONFIG_PATH}" \
   -var="aws_endpoint_url=${ENDPOINT}"
