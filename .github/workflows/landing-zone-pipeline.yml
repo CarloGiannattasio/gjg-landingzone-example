@@ -7,6 +7,7 @@
 name: Landing Zone Pipeline
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
