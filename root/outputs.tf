@@ -54,11 +54,36 @@ output "iam_role_arns" {
 }
 
 output "gcp_project_id" {
-  description = "GCP project id from the decoded multi-cloud config. No GCP resources are created."
+  description = "GCP project id from the selected project config."
   value       = local.gcp_config.project_id
 }
 
 output "gcp_environment" {
-  description = "GCP environment from the decoded multi-cloud config. No GCP resources are created."
+  description = "GCP environment from the selected project config."
   value       = local.gcp_config.environment
+}
+
+output "network_id" {
+  description = "ID of the GCP VPC network."
+  value       = module.gcp_vpc.network_id
+}
+
+output "network_name" {
+  description = "Name of the GCP VPC network."
+  value       = module.gcp_vpc.network_name
+}
+
+output "gcp_public_subnet_ids" {
+  description = "IDs of the GCP public subnets."
+  value       = module.gcp_vpc.public_subnet_ids
+}
+
+output "gcp_private_subnet_ids" {
+  description = "IDs of the GCP private subnets."
+  value       = module.gcp_vpc.private_subnet_ids
+}
+
+output "gcp_nat_gateway_count" {
+  description = "Number of GCP NAT gateways created for the selected T-shirt size."
+  value       = module.gcp_vpc.nat_gateway_count
 }
