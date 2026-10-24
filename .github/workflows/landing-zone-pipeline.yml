@@ -1059,3 +1059,46 @@ jobs:
             });
 
             await upsert(comments, REAL_MARKER, render(REAL_MARKER, realHeader, realSections));
+
+  # Fan-in. GitHub draws a separate graph for every job that nothing needs.
+  # This job needs the rest, so the run is one pipeline. Skipped jobs (no
+  # credentials, or a comment job on push) do not fail it. A failed job does.
+  pipeline:
+    name: pipeline
+    needs:
+      - lint-and-scan
+      - terraform-test
+      - aws-credentials-present
+      - gcp-credentials-present
+      - terraform-plan
+      - terraform-plan-gcp
+      - terraform-plan-moto
+      - terraform-plan-gcp-mock
+      - comment-plans
+      - comment-gcp-plan
+      - comment-moto-plans
+      - comment-gcp-mock
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail when any job failed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["RESULTS"])
+          bad = sorted(
+              name
+              for name, info in needs.items()
+              if info.get("result") not in ("success", "skipped")
+          )
+          if bad:
+              print("Failed jobs: " + ", ".join(bad), file=sys.stderr)
+              sys.exit(1)
+          print("No failed jobs.")
+          PY

@@ -9,8 +9,9 @@
 #   private netnums 10 .. 10+zone_count-1
 #
 # The network is custom mode and has no CIDR of its own. A custom-mode
-# network has no implied allow rules, so this module creates no firewall
-# rules and does not open 0.0.0.0/0. The GCP default network is left in place.
+# network starts with an implied deny ingress. This module adds an explicit
+# deny-all ingress firewall and does not open 0.0.0.0/0. The GCP default
+# network is left in place.
 
 locals {
   # Zone count is derived from t-shirt size. It is intentionally not a variable.
@@ -83,6 +84,28 @@ resource "google_compute_network" "this" {
   # hashicorp/google 8.8.1 does not accept labels on this resource.
 }
 
+# CKV2_GCP_18 requires a firewall connected to this network. Deny every
+# ingress protocol. Priority 65534 sits just above the implied deny (65535)
+# and does not allow traffic. A later allow rule can still be more specific.
+resource "google_compute_firewall" "deny_all_ingress" {
+  name    = "${var.name}-deny-all-ingress"
+  project = var.project_id
+  network = google_compute_network.this.id
+
+  direction = "INGRESS"
+  priority  = 65534
+
+  deny {
+    protocol = "all"
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+
+  log_config {
+    metadata = "INCLUDE_ALL_METADATA"
+  }
+}
+
 resource "google_compute_subnetwork" "public" {
   count = local.availability_zone_count
 
@@ -91,9 +114,9 @@ resource "google_compute_subnetwork" "public" {
   region        = var.region
   network       = google_compute_network.this.id
   ip_cidr_range = cidrsubnet(var.cidr_block, 8, count.index)
-  # Public subnets do not need Private Google Access. Private subnets enable
-  # it, and Cloud NAT covers only those private subnets.
-  private_ip_google_access = false
+  # Private Google Access is on for public subnets too (CKV_GCP_74). It does
+  # not assign a public IP. Instances reach Google APIs on Google's network.
+  private_ip_google_access = true
 
   # Flow logs are a subnet log_config on GCP, not a separate resource.
   # The block is omitted unless requested so sampling stays off by default.

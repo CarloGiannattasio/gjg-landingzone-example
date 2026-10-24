@@ -42,7 +42,7 @@ The pipeline is **plan-only**. `terraform apply` is commented out in the workflo
 | `config/aws/example/*` | Account files for prod, nonprod, and preprod. `config_path` selects one of them. |
 | `config/gcp/example/example-prod` | GCP project file. `gcp_config_path` selects it. |
 | `modules/aws-vpc-tshirt` | VPC, subnets, and NAT from a T-shirt size. Removes the default VPC. |
-| `modules/gcp-vpc-tshirt` | Custom-mode VPC, subnets, Cloud Router, and Cloud NAT from a T-shirt size. Does not delete the GCP default network. |
+| `modules/gcp-vpc-tshirt` | Custom-mode VPC, deny-all ingress firewall, subnets, Cloud Router, and Cloud NAT from a T-shirt size. Does not delete the GCP default network. |
 | `modules/aws-iam-role` | Role plus customer managed policy. Both documents are loaded with `file()`. |
 | `policies/` | Trust and permissions JSON, separate from the module source. |
 | `root/` | Composition root. No remote backend; state stays local for this example. |
@@ -91,7 +91,7 @@ The Google provider project and region come from the GCP file. Credentials come 
 
 Flow logs are enabled for prod and preprod (`enable_flow_logs: true`). Nonprod leaves them disabled. Every AWS account file sets `delete_default_vpc: true`.
 
-`modules/gcp-vpc-tshirt` uses the same sizes. Small is one zone and one Cloud NAT, Medium is two zones and one shared Cloud NAT, and Large is three zones and one Cloud NAT per zone. The example GCP project is Large (`10.50.0.0/16`, flow logs on). The module does not delete the GCP default network and does not open `0.0.0.0/0`.
+`modules/gcp-vpc-tshirt` uses the same sizes. Small is one zone and one Cloud NAT, Medium is two zones and one shared Cloud NAT, and Large is three zones and one Cloud NAT per zone. The example GCP project is Large (`10.50.0.0/16`, flow logs on). The module does not delete the GCP default network. It defines a deny-all ingress firewall and does not open `0.0.0.0/0`. Private Google Access is on for every subnet.
 
 ## IAM documents
 
@@ -185,12 +185,13 @@ Permissions at the workflow level are `contents: read` and `id-token: write`. Th
 | `comment-gcp-mock` | Pull requests only. Downloads every GCP mock artifact and posts or updates one sticky comment (`<!-- landing-zone-plan-gcp-mock -->`) with one section per config. | None |
 | `comment-plans` | Pull requests only. Posts or updates the real-account sticky comment (`<!-- landing-zone-plan-real -->`) with one section per config. Says the real plan was skipped when AWS secrets are unset. Does not check out code. | None |
 | `comment-gcp-plan` | Pull requests only. Posts or updates `<!-- landing-zone-plan-gcp -->` with one section per config, or a note that the real GCP plan was skipped and which credential set was missing. Does not check out code. | None |
+| `pipeline` | Needs every other job, so the Actions graph is one pipeline. Fails when any needed job failed. A skipped job (no credentials, or a comment job on push) does not fail it. | None |
 
 `terraform apply -input=false tfplan` is present only as a YAML comment on the real AWS plan job and the real GCP plan job. GitHub Actions does not parse it, so apply is not a step and cannot run. Promoting a plan to apply would be a separate, reviewed change.
 
 On a pull request, `comment-moto-plans` updates `<!-- landing-zone-plan -->` and `comment-gcp-mock` updates `<!-- landing-zone-plan-gcp-mock -->`. Each mock matrix matches the real-credential config list, and each comment has one section per config. Those comments state that the run is a mock plan, uses no cloud credentials, and is not a live apply. The section summary shows the config name and the plan summary line (for example `Plan: N to add`) when that line is present, and the plan text is in a collapsed details block, truncated near 60k characters. `comment-plans` updates `<!-- landing-zone-plan-real -->`. `comment-gcp-plan` updates `<!-- landing-zone-plan-gcp -->` with the real plan, or a note that it was skipped. Secret values are not printed. Pushes to `main` and manual `workflow_dispatch` runs still plan and do not comment, because those events are not pull requests.
 
-`.github/CODEOWNERS` names `@CarloGiannattasio` as the owner of every path. Merges to `main` are meant to require that code owner's approval, dismiss stale approvals, block force pushes and deletions, and require `lint-and-scan`, `terraform-test`, `terraform-plan-moto`, and `real-account credentials check`. `terraform-plan-moto` is a matrix, so each AWS account file is its own check. `terraform-plan (real AWS account)` is not required, because that job is skipped when secrets are unset and a skipped required check would block merges. Admin bypass stays available so the code owner is not locked out of a pull request they opened. Everyone else still needs that code-owner approval.
+`.github/CODEOWNERS` names `@CarloGiannattasio` as the owner of every path. Merges to `main` are meant to require that code owner's approval, dismiss stale approvals, block force pushes and deletions, and require `pipeline`. That job needs every other job, so one required check covers lint, tests, mock plans, and the real plans. `terraform-plan (real AWS account)` stays skipped when secrets are unset, and a skipped needed job does not fail `pipeline`. Admin bypass stays available so the code owner is not locked out of a pull request they opened. Everyone else still needs that code-owner approval.
 
 Those rules are not enforced yet. Branch protection and repository rulesets both returned HTTP 403: `Upgrade to GitHub Pro or make this repository public to enable this feature.` The repository is private, and making it public was not used as a workaround. Apply the settings above once GitHub Pro (or a public repository) is available, and leave "Do not allow bypassing the above settings" unchecked.
 
