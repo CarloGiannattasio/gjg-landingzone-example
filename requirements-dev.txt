@@ -1,0 +1,9 @@
+# Cloud Custodian does not publish an artifact named moto3.
+# Dev group pin: moto>=5.0,<6.0
+# https://github.com/cloud-custodian/cloud-custodian/blob/main/pyproject.toml
+# Resolved on main: moto==5.2.3
+# https://github.com/cloud-custodian/cloud-custodian/blob/main/uv.lock
+# Their AWS tests call moto.mock_aws (tests/test_org.py, tests/test_kms.py,
+# tests/test_sns.py). That decorator is in-process. The server extra of the
+# same release exposes ThreadedMotoServer so Terraform can plan over HTTP.
+moto[server]==5.2.3
