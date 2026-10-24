@@ -1,0 +1,29 @@
+{
+  "account_name": "example-preprod",
+  "environment": "preprod",
+  "business_unit": "example",
+  "region": "us-east-1",
+  "cost_center": "CC-1000",
+  "mandatory_tags": {
+    "BusinessUnit": "example",
+    "Environment": "preprod",
+    "CostCenter": "CC-1000",
+    "ManagedBy": "terraform",
+    "Owner": "platform",
+    "DataClassification": "internal"
+  },
+  "vpc": {
+    "name": "example-preprod-vpc",
+    "tshirt_size": "Medium",
+    "cidr_block": "10.30.0.0/16",
+    "delete_default_vpc": true,
+    "enable_flow_logs": true
+  },
+  "iam_roles": [
+    {
+      "name": "example-admin",
+      "trust_policy": "pipeline-trust.json",
+      "permission_policy": "example-admin-policy.json"
+    }
+  ]
+}

@@ -1,0 +1,255 @@
+# Landing zone pipeline. Plan-only by default.
+# contents: read is enough to check out the repo.
+# id-token: write lets the plan job assume AWS_PLAN_ROLE_ARN with GitHub OIDC.
+# No static AWS access keys are stored in this workflow.
+name: Landing Zone Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.9.8"
+
+jobs:
+  lint-and-scan:
+    name: lint-and-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          # The wrapper hides Terraform's exit code. fmt -check must fail the job.
+          terraform_wrapper: false
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.65.0
+
+      - name: TFLint
+        run: tflint --init && tflint --recursive
+        env:
+          # Raises the GitHub API rate limit if a plugin install is required.
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # IAM JSON under policies/ is loaded with file() and is not Terraform.
+      # Checkov's terraform framework scans the modules and the root module.
+      # soft_fail is omitted so findings fail the job. No checks are skipped.
+      - name: Checkov (modules)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: modules
+          framework: terraform
+          output_format: cli
+          download_external_modules: false
+
+      - name: Checkov (root)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: root
+          framework: terraform
+          output_format: cli
+          download_external_modules: false
+
+      - name: Validate landing zone config contract
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          required = (
+              "environment",
+              "business_unit",
+              "region",
+              "cost_center",
+              "mandatory_tags",
+              "vpc",
+          )
+          files = sorted(Path("config").rglob("*.json"))
+          if not files:
+              print("No files matched config/**/*.json.", file=sys.stderr)
+              sys.exit(1)
+
+          failed = False
+          for path in files:
+              try:
+                  document = json.loads(path.read_text())
+              except json.JSONDecodeError as exc:
+                  print(f"{path}: invalid JSON ({exc})", file=sys.stderr)
+                  failed = True
+                  continue
+              if not isinstance(document, dict):
+                  print(f"{path}: expected a JSON object", file=sys.stderr)
+                  failed = True
+                  continue
+
+              missing = [key for key in required if key not in document]
+              has_identity = "account_name" in document or "project_id" in document
+              if not has_identity:
+                  missing.append("account_name or project_id")
+              if missing:
+                  print(f"{path}: missing {', '.join(missing)}", file=sys.stderr)
+                  failed = True
+              else:
+                  print(f"{path}: ok")
+
+          sys.exit(1 if failed else 0)
+          PY
+
+  # Prints only oidc / static / unset. Secret values stay in the environment
+  # and are never echoed. The real plan job is skipped when this is unset.
+  aws-credentials-present:
+    name: real-account credentials check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      configured: ${{ steps.status.outputs.configured }}
+      mode: ${{ steps.status.outputs.mode }}
+    steps:
+      - id: status
+        env:
+          AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${AWS_PLAN_ROLE_ARN}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "mode=oidc" >> "$GITHUB_OUTPUT"
+          elif [ -n "${AWS_ACCESS_KEY_ID}" ] && [ -n "${AWS_SECRET_ACCESS_KEY}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "mode=static" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "mode=unset" >> "$GITHUB_OUTPUT"
+            echo "Real-account plan skipped: set AWS_PLAN_ROLE_ARN, or both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, in GitHub Actions secrets."
+          fi
+
+  terraform-plan:
+    name: terraform-plan (real AWS account)
+    needs: aws-credentials-present
+    if: needs.aws-credentials-present.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        config_path:
+          - ../config/aws/example/example-prod/example-prod.json
+          - ../config/aws/example/example-nonprod/example-nonprod.json
+          - ../config/aws/example/example-preprod/example-preprod.json
+    defaults:
+      run:
+        working-directory: root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Plan-only. No static keys are stored in this file. OIDC is preferred.
+      # Static keys are used only when the role secret is empty and both key
+      # secrets are set. Values are not printed.
+      - name: Configure AWS credentials from OIDC role
+        if: needs.aws-credentials-present.outputs.mode == 'oidc'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Configure AWS credentials from static keys
+        if: needs.aws-credentials-present.outputs.mode == 'static'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Terraform init
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        run: terraform plan -input=false -no-color -var="config_path=${{ matrix.config_path }}" -out=tfplan
+
+      # SAFETY: live apply is intentionally disabled. This pipeline defaults to
+      # plan-only execution. The block below is a YAML comment, so GitHub
+      # Actions does not parse it and the command cannot run.
+      #
+      # - name: Terraform apply
+      #   run: terraform apply -input=false tfplan
+
+  terraform-plan-moto:
+    name: terraform-plan-moto
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Nonprod config, Cloud Custodian's pinned Moto. No AWS secrets. No apply.
+      - name: Terraform plan against Moto
+        run: ./scripts/plan-with-c7n-moto.sh
+
+  terraform-test:
+    name: terraform-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # tests/vpc_tshirt.tftest.hcl mocks the AWS provider. No credentials.
+      # Init installs the module referenced by the test file. There is no
+      # root module in the repository root, so this init is only for tests.
+      - name: Terraform init
+        working-directory: ${{ github.workspace }}
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform test
+        working-directory: ${{ github.workspace }}
+        run: terraform test

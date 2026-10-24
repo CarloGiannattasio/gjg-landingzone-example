@@ -1,0 +1,29 @@
+{
+  "account_name": "example-nonprod",
+  "environment": "nonprod",
+  "business_unit": "example",
+  "region": "us-east-1",
+  "cost_center": "CC-1000",
+  "mandatory_tags": {
+    "BusinessUnit": "example",
+    "Environment": "nonprod",
+    "CostCenter": "CC-1000",
+    "ManagedBy": "terraform",
+    "Owner": "platform",
+    "DataClassification": "internal"
+  },
+  "vpc": {
+    "name": "example-nonprod-vpc",
+    "tshirt_size": "Small",
+    "cidr_block": "10.20.0.0/16",
+    "delete_default_vpc": true,
+    "enable_flow_logs": false
+  },
+  "iam_roles": [
+    {
+      "name": "example-admin",
+      "trust_policy": "pipeline-trust.json",
+      "permission_policy": "example-admin-policy.json"
+    }
+  ]
+}

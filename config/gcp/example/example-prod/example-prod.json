@@ -1,0 +1,21 @@
+{
+  "account_name": "example-prod",
+  "project_id": "example-prod",
+  "environment": "prod",
+  "business_unit": "example",
+  "region": "us-central1",
+  "cost_center": "CC-1000",
+  "mandatory_tags": {
+    "BusinessUnit": "example",
+    "Environment": "prod",
+    "CostCenter": "CC-1000",
+    "ManagedBy": "terraform",
+    "Owner": "platform",
+    "DataClassification": "internal"
+  },
+  "vpc": {
+    "name": "example-prod-vpc",
+    "cidr_block": "10.50.0.0/16",
+    "tshirt_size": "Large"
+  }
+}
