@@ -1,11 +1,10 @@
 # Landing zone pipeline. Plan-only by default.
 # contents: read is enough to check out the repo.
 # id-token: write lets the plan job assume AWS_PLAN_ROLE_ARN with GitHub OIDC.
-# pull-requests: write is set on the jobs that comment: comment-moto-plans,
-# comment-gcp-mock, comment-plans, and comment-gcp-plan.
-# comment-plans and comment-gcp-plan do not check out the pull request.
-# comment-moto-plans and comment-gcp-mock check out only to load the comment
-# helper. Plan scripts do not receive GITHUB_TOKEN.
+# pull-requests: write and issues: write are set on pipeline. On a pull
+# request that job posts one plans table and deletes the older plan comments.
+# Plan scripts do not receive GITHUB_TOKEN. Push and workflow_dispatch do not
+# comment, so those graphs have no comment jobs.
 # No static AWS or GCP keys are stored in this workflow.
 name: Landing Zone Pipeline
 
@@ -167,6 +166,7 @@ jobs:
       fail-fast: false
       matrix:
         # Mock job terraform-plan-moto aliases this list. Add an account file here only.
+        # pipeline AWS_ACCOUNTS is the basename of each path, in this order.
         config_path: &aws_config_paths
           - ../config/aws/example/example-prod/example-prod.json
           - ../config/aws/example/example-nonprod/example-nonprod.json
@@ -258,8 +258,8 @@ jobs:
       #   run: terraform apply -input=false tfplan
 
   # Mock plan of the same AWS account files as terraform-plan. No AWS or GCP
-  # secrets. Does not comment. On pull_request, comment-moto-plans posts
-  # <!-- landing-zone-plan -->. Push to main and workflow_dispatch still plan.
+  # secrets. Does not comment. On pull_request, pipeline posts the plans table.
+  # Push to main and workflow_dispatch still plan and do not comment.
   terraform-plan-moto:
     name: terraform-plan-moto
     runs-on: ubuntu-latest
@@ -319,46 +319,6 @@ jobs:
           retention-days: 7
           overwrite: true
 
-  # One sticky Moto comment for the whole matrix. Pull requests only.
-  # Push to main and workflow_dispatch do not comment.
-  comment-moto-plans:
-    name: comment-moto-plans
-    needs: terraform-plan-moto
-    if: >-
-      always() &&
-      github.event_name == 'pull_request' &&
-      needs.terraform-plan-moto.result != 'cancelled'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Download Moto plans
-        if: always()
-        uses: actions/download-artifact@v8
-        continue-on-error: true
-        with:
-          pattern: plan-moto-*
-          path: plans/moto
-
-      - name: Post or update sticky Moto plan comment
-        if: always()
-        uses: actions/github-script@v9
-        env:
-          PLAN_RESULT: ${{ needs.terraform-plan-moto.result }}
-          PLAN_DIR: ${{ github.workspace }}/plans/moto
-        with:
-          script: |
-            const path = require("path");
-            const { postMotoPlanComment } = require(path.join(process.env.GITHUB_WORKSPACE, "scripts", "moto-plan-comment.js"));
-            await postMotoPlanComment({ github, context, core });
-
   terraform-test:
     name: terraform-test
     runs-on: ubuntu-latest
@@ -384,220 +344,6 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: terraform test
 
-  # Real-account plan comment only. comment-moto-plans posts <!-- landing-zone-plan -->.
-  # No checkout: the pull request tree is not on disk, and this token cannot
-  # be used by that code. Pull requests only; push and workflow_dispatch skip it.
-  comment-plans:
-    name: comment-plans
-    needs:
-      - aws-credentials-present
-      - terraform-plan
-    if: >-
-      always() &&
-      github.event_name == 'pull_request' &&
-      needs.aws-credentials-present.result != 'cancelled'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Download real-account plans
-        if: always()
-        uses: actions/download-artifact@v8
-        continue-on-error: true
-        with:
-          pattern: plan-real-*
-          path: plans/real
-
-      - name: Post or update sticky plan comments
-        if: always()
-        uses: actions/github-script@v9
-        env:
-          REAL_RESULT: ${{ needs.terraform-plan.result }}
-          REAL_CONFIGURED: ${{ needs.aws-credentials-present.outputs.configured }}
-          REAL_MODE: ${{ needs.aws-credentials-present.outputs.mode }}
-          CREDENTIALS_RESULT: ${{ needs.aws-credentials-present.result }}
-        with:
-          script: |
-            const fs = require("fs");
-            const path = require("path");
-
-            const MAX_PLAN = 60000;
-            const MAX_COMMENT = 65000;
-            const REAL_MARKER = "<!-- landing-zone-plan-real -->";
-
-            function stripAnsi(text) {
-              return String(text)
-                .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
-                .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "");
-            }
-
-            function redact(text) {
-              return stripAnsi(text)
-                .replace(/\u0000/g, "")
-                .replace(/\b(AKIA|ASIA|AROA|AIDA)[0-9A-Z]{16}\b/g, "[redacted]")
-                .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
-                .replace(/\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
-                .replace(/(aws_secret_access_key|aws_access_key_id)\s*[:=]\s*\S+/gi, "$1=[redacted]");
-            }
-
-            function truncate(text, limit) {
-              if (text.length <= limit) return text;
-              const suffix = `\n… truncated to ${limit} characters`;
-              const keep = Math.max(0, limit - suffix.length);
-              return text.slice(0, keep) + suffix;
-            }
-
-            function escapeHtml(text) {
-              return text
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;");
-            }
-
-            function planHtml(body, limit) {
-              const clipped = truncate(redact(body), limit);
-              let escaped = escapeHtml(clipped);
-              if (escaped.length > limit) {
-                escaped = truncate(escaped, limit);
-              }
-              return escaped;
-            }
-
-            function detailsBlock(summary, body, limit) {
-              return [
-                "<details>",
-                `<summary>${escapeHtml(summary)}</summary>`,
-                "",
-                `<pre><code>${planHtml(body, limit)}</code></pre>`,
-                "</details>",
-              ].join("\n");
-            }
-
-            function walkTxt(dir, found) {
-              if (!fs.existsSync(dir)) return;
-              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                const full = path.join(dir, entry.name);
-                if (entry.isDirectory()) walkTxt(full, found);
-                else if (entry.isFile() && entry.name.endsWith(".txt")) found.push(full);
-              }
-            }
-
-            function planSummaryLine(text) {
-              const plan = text.match(/^Plan:\s+\d+\s+to add,\s+\d+\s+to change,\s+\d+\s+to destroy\.?\s*$/m);
-              if (plan) return plan[0].trim();
-              const none = text.match(/^No changes\..+$/m);
-              if (none) return none[0].trim();
-              return "";
-            }
-
-            function sectionsUnder(dir) {
-              if (!fs.existsSync(dir)) return [];
-              const files = [];
-              walkTxt(dir, files);
-              files.sort();
-              return files.map((file) => {
-                const raw = stripAnsi(fs.readFileSync(file, "utf8").slice(0, 80000));
-                const name = path.basename(file, ".txt");
-                const summaryLine = planSummaryLine(raw);
-                return {
-                  summary: summaryLine ? `${name}: ${summaryLine}` : name,
-                  body: raw.trim() ? raw : "(no output)",
-                };
-              });
-            }
-
-            function render(marker, header, sections) {
-              const wrapper = (summary) =>
-                `<details>\n<summary>${escapeHtml(summary)}</summary>\n\n<pre><code></code></pre>\n</details>\n\n`.length;
-              let overhead = marker.length + 1 + header.length + 2;
-              for (const section of sections) overhead += wrapper(section.summary);
-              const per =
-                sections.length === 0
-                  ? MAX_PLAN
-                  : Math.max(2000, Math.min(MAX_PLAN, Math.floor((MAX_COMMENT - overhead) / sections.length)));
-              const blocks = sections.map((section) => detailsBlock(section.summary, section.body, per));
-              let body = `${marker}\n${header}`;
-              if (blocks.length) body += `\n\n${blocks.join("\n\n")}`;
-              if (body.length > MAX_COMMENT && sections.length) {
-                const overflow = body.length - MAX_COMMENT;
-                const tighter = Math.max(500, per - Math.ceil(overflow / sections.length) - 80);
-                const again = sections.map((section) => detailsBlock(section.summary, section.body, tighter));
-                body = `${marker}\n${header}\n\n${again.join("\n\n")}`;
-              }
-              if (body.length > MAX_COMMENT) {
-                body = `${body.slice(0, MAX_COMMENT - 28)}\n… comment truncated`;
-              }
-              return body;
-            }
-
-            async function upsert(comments, marker, body) {
-              const existing = comments.find(
-                (comment) => typeof comment.body === "string" && comment.body.startsWith(marker)
-              );
-              if (existing) {
-                await github.rest.issues.updateComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: existing.id,
-                  body,
-                });
-                console.log(`Updated comment ${existing.id} for ${marker}`);
-                return;
-              }
-              const created = await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-              comments.push(created.data);
-              console.log(`Created comment ${created.data.id} for ${marker}`);
-            }
-
-            const realResult = process.env.REAL_RESULT || "unknown";
-            const configured = process.env.REAL_CONFIGURED || "";
-            const mode = process.env.REAL_MODE || "";
-            const credentialsResult = process.env.CREDENTIALS_RESULT || "unknown";
-            const secretsUnset = configured === "false" || mode === "unset";
-            const realSkipped = realResult === "skipped";
-
-            let realHeader = "## Terraform plan (real AWS account)\n\n";
-            let realSections = [];
-            if (realSkipped && secretsUnset) {
-              realHeader +=
-                "Real-account plan was skipped because AWS plan secrets are unset. " +
-                "Set `AWS_PLAN_ROLE_ARN`, or both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, " +
-                "in GitHub Actions secrets to run this plan. Secret values are not printed.";
-            } else if (realSkipped) {
-              realHeader +=
-                `Real-account plan was skipped (credentials check result: \`${credentialsResult}\`). ` +
-                "Secret values are not printed.";
-            } else {
-              realHeader +=
-                "Job `terraform-plan (real AWS account)` " +
-                `result: \`${realResult}\`. Credential mode: \`${mode || "unknown"}\`. ` +
-                "Secret values are not printed.";
-              realSections = sectionsUnder("plans/real");
-              if (realSections.length === 0) {
-                realHeader += "\n\nThe real-account plan job did not upload plan output.";
-              }
-            }
-
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              per_page: 100,
-            });
-
-            await upsert(comments, REAL_MARKER, render(REAL_MARKER, realHeader, realSections));
-
-  # Prints only wif / sa_key / unset and oidc / static / unset. Secret values
-  # stay in the environment and are never echoed. The real GCP plan runs only
-  # when both a GCP mode and an AWS plan mode are set, because root talks to
-  # both providers.
   gcp-credentials-present:
     name: real GCP credentials check
     runs-on: ubuntu-latest
@@ -639,8 +385,8 @@ jobs:
           fi
 
   # Real plan of root for each GCP project file. Needs GCP and AWS credentials,
-  # because one root plan talks to both providers. On pull_request,
-  # comment-gcp-plan updates <!-- landing-zone-plan-gcp -->. Apply is not a step.
+  # because one root plan talks to both providers. Apply is not a step.
+  # On pull_request, pipeline posts the add, change, and destroy counts.
   terraform-plan-gcp:
     name: terraform-plan (real GCP)
     needs: gcp-credentials-present
@@ -651,6 +397,7 @@ jobs:
       fail-fast: false
       matrix:
         # Mock job terraform-plan-gcp-mock aliases this list. Add a project file here only.
+        # pipeline GCP_ACCOUNTS is the basename of each path, in this order.
         gcp_config_path: &gcp_config_paths
           - ../config/gcp/example/example-prod/example-prod.json
     defaults:
@@ -738,8 +485,8 @@ jobs:
       #   run: terraform apply -input=false tfplan
 
   # Mock plan of the same GCP project files as terraform-plan-gcp. No real
-  # credentials. Does not comment. On pull_request, comment-gcp-mock posts
-  # <!-- landing-zone-plan-gcp-mock -->. Push to main and workflow_dispatch still plan.
+  # credentials. Does not comment. On pull_request, pipeline posts the plans
+  # table. Push to main and workflow_dispatch still plan and do not comment.
   terraform-plan-gcp-mock:
     name: terraform-plan-gcp-mock
     runs-on: ubuntu-latest
@@ -799,270 +546,11 @@ jobs:
           retention-days: 7
           overwrite: true
 
-  # One sticky GCP mock comment for the whole matrix. Pull requests only.
-  # Push to main and workflow_dispatch do not comment.
-  comment-gcp-mock:
-    name: comment-gcp-mock
-    needs: terraform-plan-gcp-mock
-    if: >-
-      always() &&
-      github.event_name == 'pull_request' &&
-      needs.terraform-plan-gcp-mock.result != 'cancelled'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Download GCP mock plans
-        if: always()
-        uses: actions/download-artifact@v8
-        continue-on-error: true
-        with:
-          pattern: plan-gcp-mock-*
-          path: plans/gcp-mock
-
-      - name: Post or update sticky GCP mock plan comment
-        if: always()
-        uses: actions/github-script@v9
-        env:
-          PLAN_RESULT: ${{ needs.terraform-plan-gcp-mock.result }}
-          PLAN_DIR: ${{ github.workspace }}/plans/gcp-mock
-        with:
-          script: |
-            const path = require("path");
-            const { postGcpMockPlanComment } = require(path.join(process.env.GITHUB_WORKSPACE, "scripts", "gcp-mock-plan-comment.js"));
-            await postGcpMockPlanComment({ github, context, core });
-
-  # Real GCP plan comment only. comment-gcp-mock posts <!-- landing-zone-plan-gcp-mock -->.
-  # No checkout. Pull requests only; push and workflow_dispatch skip it.
-  comment-gcp-plan:
-    name: comment-gcp-plan
-    needs:
-      - gcp-credentials-present
-      - terraform-plan-gcp
-    if: >-
-      always() &&
-      github.event_name == 'pull_request' &&
-      needs.gcp-credentials-present.result != 'cancelled'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Download real GCP plan
-        if: always()
-        uses: actions/download-artifact@v8
-        continue-on-error: true
-        with:
-          # Digits only, so this does not also download plan-gcp-mock-*.
-          pattern: plan-gcp-[0-9]*
-          path: plans/gcp
-
-      - name: Post or update sticky GCP plan comment
-        if: always()
-        uses: actions/github-script@v9
-        env:
-          REAL_RESULT: ${{ needs.terraform-plan-gcp.result }}
-          REAL_CONFIGURED: ${{ needs.gcp-credentials-present.outputs.configured }}
-          GCP_MODE: ${{ needs.gcp-credentials-present.outputs.gcp_mode }}
-          AWS_MODE: ${{ needs.gcp-credentials-present.outputs.aws_mode }}
-        with:
-          script: |
-            const fs = require("fs");
-            const path = require("path");
-
-            const MAX_PLAN = 60000;
-            const MAX_COMMENT = 65000;
-            const REAL_MARKER = "<!-- landing-zone-plan-gcp -->";
-
-            function stripAnsi(text) {
-              return String(text)
-                .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
-                .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "");
-            }
-
-            function redact(text) {
-              return stripAnsi(text)
-                .replace(/\u0000/g, "")
-                .replace(/\b(AKIA|ASIA|AROA|AIDA)[0-9A-Z]{16}\b/g, "[redacted]")
-                .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
-                .replace(/\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
-                .replace(/(aws_secret_access_key|aws_access_key_id|aws_session_token)\s*[:=]\s*\S+/gi, "$1=[redacted]")
-                .replace(/"private_key"\s*:\s*"[^"]*"/g, '"private_key":"[redacted]"')
-                .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted]")
-                .replace(/\bya29\.[0-9A-Za-z\-_]+\b/g, "[redacted]");
-            }
-
-            function truncate(text, limit) {
-              if (text.length <= limit) return text;
-              const suffix = `\n… truncated to ${limit} characters`;
-              const keep = Math.max(0, limit - suffix.length);
-              return text.slice(0, keep) + suffix;
-            }
-
-            function escapeHtml(text) {
-              return text
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;");
-            }
-
-            function planHtml(body, limit) {
-              const clipped = truncate(redact(body), limit);
-              let escaped = escapeHtml(clipped);
-              if (escaped.length > limit) escaped = truncate(escaped, limit);
-              return escaped;
-            }
-
-            function detailsBlock(summary, body, limit) {
-              return [
-                "<details>",
-                `<summary>${escapeHtml(summary)}</summary>`,
-                "",
-                `<pre><code>${planHtml(body, limit)}</code></pre>`,
-                "</details>",
-              ].join("\n");
-            }
-
-            function walkTxt(dir, found) {
-              if (!fs.existsSync(dir)) return;
-              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                const full = path.join(dir, entry.name);
-                if (entry.isDirectory()) walkTxt(full, found);
-                else if (entry.isFile() && entry.name.endsWith(".txt")) found.push(full);
-              }
-            }
-
-            function planSummaryLine(text) {
-              const plan = text.match(/^Plan:\s+\d+\s+to add,\s+\d+\s+to change,\s+\d+\s+to destroy\.?\s*$/m);
-              if (plan) return plan[0].trim();
-              const none = text.match(/^No changes\..+$/m);
-              if (none) return none[0].trim();
-              return "";
-            }
-
-            function sectionsUnder(dir) {
-              if (!fs.existsSync(dir)) return [];
-              const files = [];
-              walkTxt(dir, files);
-              files.sort();
-              return files.map((file) => {
-                const raw = stripAnsi(fs.readFileSync(file, "utf8").slice(0, 80000));
-                const name = path.basename(file, ".txt");
-                const summaryLine = planSummaryLine(raw);
-                return {
-                  summary: summaryLine ? `${name}: ${summaryLine}` : name,
-                  body: raw.trim() ? raw : "(no output)",
-                };
-              });
-            }
-
-            function render(marker, header, sections) {
-              const wrapper = (summary) =>
-                `<details>\n<summary>${escapeHtml(summary)}</summary>\n\n<pre><code></code></pre>\n</details>\n\n`.length;
-              let overhead = marker.length + 1 + header.length + 2;
-              for (const section of sections) overhead += wrapper(section.summary);
-              const per =
-                sections.length === 0
-                  ? MAX_PLAN
-                  : Math.max(2000, Math.min(MAX_PLAN, Math.floor((MAX_COMMENT - overhead) / sections.length)));
-              const blocks = sections.map((section) => detailsBlock(section.summary, section.body, per));
-              let body = `${marker}\n${header}`;
-              if (blocks.length) body += `\n\n${blocks.join("\n\n")}`;
-              if (body.length > MAX_COMMENT && sections.length) {
-                const overflow = body.length - MAX_COMMENT;
-                const tighter = Math.max(500, per - Math.ceil(overflow / sections.length) - 80);
-                const again = sections.map((section) => detailsBlock(section.summary, section.body, tighter));
-                body = `${marker}\n${header}\n\n${again.join("\n\n")}`;
-              }
-              if (body.length > MAX_COMMENT) {
-                body = `${body.slice(0, MAX_COMMENT - 28)}\n… comment truncated`;
-              }
-              return body;
-            }
-
-            async function upsert(comments, marker, body) {
-              const existing = comments.find(
-                (comment) => typeof comment.body === "string" && comment.body.startsWith(marker)
-              );
-              if (existing) {
-                await github.rest.issues.updateComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: existing.id,
-                  body,
-                });
-                console.log(`Updated comment ${existing.id} for ${marker}`);
-                return;
-              }
-              const created = await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-              comments.push(created.data);
-              console.log(`Created comment ${created.data.id} for ${marker}`);
-            }
-
-            const realResult = process.env.REAL_RESULT || "unknown";
-            const configured = process.env.REAL_CONFIGURED || "";
-            const gcpMode = process.env.GCP_MODE || "unset";
-            const awsMode = process.env.AWS_MODE || "unset";
-            const realSkipped = realResult === "skipped" || configured !== "true";
-
-            let realHeader = "## Terraform plan (real GCP)\n\n";
-            let realSections = [];
-            if (realSkipped && gcpMode === "unset" && awsMode === "unset") {
-              realHeader +=
-                "Real GCP plan was skipped because a plan of root talks to both providers, " +
-                "and both GCP credentials and AWS plan secrets are unset. " +
-                "Set `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT` (or `GCP_SA_KEY`), " +
-                "and `AWS_PLAN_ROLE_ARN` (or both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`). " +
-                "Secret values are not printed. Apply is not a step in this workflow.";
-            } else if (realSkipped && gcpMode === "unset") {
-              realHeader +=
-                `Real GCP plan was skipped because GCP credentials are unset. AWS plan mode is \`${awsMode}\`. ` +
-                "Set `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT`, or `GCP_SA_KEY`. " +
-                "Secret values are not printed. Apply is not a step in this workflow.";
-            } else if (realSkipped && awsMode === "unset") {
-              realHeader +=
-                `Real GCP plan was skipped because AWS plan secrets are unset. GCP mode is \`${gcpMode}\`. ` +
-                "A plan of root talks to both providers, so AWS plan credentials are required too. " +
-                "Secret values are not printed. Apply is not a step in this workflow.";
-            } else if (realSkipped) {
-              realHeader +=
-                `Real GCP plan was skipped (job result: \`${realResult}\`). Secret values are not printed.`;
-            } else {
-              realHeader +=
-                "Job `terraform-plan (real GCP)` " +
-                `result: \`${realResult}\`. GCP mode: \`${gcpMode}\`. AWS mode: \`${awsMode}\`. ` +
-                "Secret values are not printed. This run does not apply.";
-              realSections = sectionsUnder("plans/gcp");
-              if (realSections.length === 0) {
-                realHeader += "\n\nThe real GCP plan job did not upload plan output.";
-              }
-            }
-
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              per_page: 100,
-            });
-
-            await upsert(comments, REAL_MARKER, render(REAL_MARKER, realHeader, realSections));
-
   # Fan-in. GitHub draws a separate graph for every job that nothing needs.
-  # This job needs the rest, so the run is one pipeline. Skipped jobs (no
-  # credentials, or a comment job on push) do not fail it. A failed job does.
+  # This job needs the rest, so the run is one pipeline. On a pull request it
+  # posts one comment: a table of each plan, the account, and the add, change,
+  # and destroy counts. Push and workflow_dispatch do not comment. A skipped
+  # plan does not fail this job. A failed job does.
   pipeline:
     name: pipeline
     needs:
@@ -1074,13 +562,13 @@ jobs:
       - terraform-plan-gcp
       - terraform-plan-moto
       - terraform-plan-gcp-mock
-      - comment-plans
-      - comment-gcp-plan
-      - comment-moto-plans
-      - comment-gcp-mock
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
     steps:
       - name: Fail when any job failed
         env:
@@ -1102,3 +590,38 @@ jobs:
               sys.exit(1)
           print("No failed jobs.")
           PY
+
+      - name: Checkout
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download plans
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: plan-*
+          path: plans
+
+      - name: Post the plans table
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        env:
+          PLAN_ROOT: ${{ github.workspace }}/plans
+          AWS_ACCOUNTS: example-prod,example-nonprod,example-preprod
+          GCP_ACCOUNTS: example-prod
+          MOTO_RESULT: ${{ needs.terraform-plan-moto.result }}
+          AWS_PLAN_RESULT: ${{ needs.terraform-plan.result }}
+          AWS_CONFIGURED: ${{ needs.aws-credentials-present.outputs.configured }}
+          GCP_MOCK_RESULT: ${{ needs.terraform-plan-gcp-mock.result }}
+          GCP_PLAN_RESULT: ${{ needs.terraform-plan-gcp.result }}
+          GCP_CONFIGURED: ${{ needs.gcp-credentials-present.outputs.configured }}
+          GCP_MODE: ${{ needs.gcp-credentials-present.outputs.gcp_mode }}
+          AWS_MODE: ${{ needs.gcp-credentials-present.outputs.aws_mode }}
+        with:
+          script: |
+            const path = require("path");
+            const { postPlanTable } = require(path.join(process.env.GITHUB_WORKSPACE, "scripts", "plan-comment.js"));
+            await postPlanTable({ github, context, core });
