@@ -29,7 +29,8 @@ The pipeline is **plan-only**. `terraform apply` is commented out in the workflo
 │   ├── providers.tf
 │   ├── variables.tf
 │   └── versions.tf
-└── tests/vpc_tshirt.tftest.hcl
+├── tests/vpc_tshirt.tftest.hcl
+└── tests.tf
 ```
 
 | Path | Role |
@@ -41,6 +42,7 @@ The pipeline is **plan-only**. `terraform apply` is commented out in the workflo
 | `policies/` | Trust and permissions JSON, separate from the module source. |
 | `root/` | Composition root. No remote backend; state stays local for this example. |
 | `tests/vpc_tshirt.tftest.hcl` | `terraform test` with a mocked AWS provider. |
+| `tests.tf` | Root configuration with no resources, so `terraform init` installs the module under test. |
 | `scripts/plan-with-c7n-moto.sh` | Local `terraform plan` against Cloud Custodian's pinned Moto. |
 | `requirements-dev.txt` | Pins that Moto release (`moto[server]==5.2.3`). |
 
@@ -111,7 +113,7 @@ This is not a substitute for the OIDC plan against real AWS. `tests/vpc_tshirt.t
 
 The script plans `config/aws/example/example-nonprod/example-nonprod.json` (Small, flow logs off). Pass another config path, relative to the `root` module, as the first argument. It does not apply. With `aws_endpoint_url` unset, the provider stays on real AWS.
 
-A plan of the nonprod config against this server succeeded: 15 to add, 0 to change, 0 to destroy. Moto answered EC2 `DescribeAvailabilityZones` (`us-east-1a`). The plan includes the VPC, public and private subnets, internet gateway, route tables and associations, NAT EIP, NAT gateway, default VPC adoption (`aws_default_vpc`), the `example-admin` IAM role, its customer managed policy, and the attachment. Flow logs and CloudWatch Logs are not in that plan because nonprod sets `enable_flow_logs` to false. Plan does not call the create APIs, and this repo does not apply, so default-VPC adoption was not executed against Moto. No resource was removed from the real-AWS path.
+A plan of the nonprod config against this server succeeded: 16 to add, 0 to change, 0 to destroy. Moto answered EC2 `DescribeAvailabilityZones` (`us-east-1a`). The plan includes the VPC, public and private subnets, the default security group with no rules, internet gateway, route tables and associations, NAT EIP, NAT gateway, default VPC adoption (`aws_default_vpc`), the `example-admin` IAM role, its customer managed policy, and the attachment. Flow logs and CloudWatch Logs are not in that plan because nonprod sets `enable_flow_logs` to false. Plan does not call the create APIs, and this repo does not apply, so default-VPC adoption was not executed against Moto. No resource was removed from the real-AWS path.
 
 ## Real account
 
@@ -134,7 +136,7 @@ terraform init -backend=false
 terraform test
 ```
 
-`terraform init` installs the module the test file references. There is no Terraform configuration in the repository root besides that test. `tests/vpc_tshirt.tftest.hcl` mocks the AWS provider, so the test does not need credentials or a cloud account.
+`terraform init` installs the module the test file references. `tests.tf` declares no resources; Terraform 1.9 needs that file to load the test. A directory with only `.tftest.hcl` files is treated as empty and skips the install. `tests/vpc_tshirt.tftest.hcl` mocks the AWS provider, so the test does not need credentials or a cloud account.
 
 ## Pipeline
 

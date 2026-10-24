@@ -21,7 +21,8 @@ provider "aws" {
   }
 
   # hashicorp/aws 6.70 endpoints block. CloudWatch Logs is `logs`
-  # (`cloudwatchlogs` is an alias and must not be set as well). S3 is not used.
+  # (`cloudwatchlogs` is an alias and must not be set as well). KMS covers
+  # flow-log encryption. S3 is not used.
   dynamic "endpoints" {
     for_each = local.moto_endpoint != null ? [local.moto_endpoint] : []
     content {
@@ -29,6 +30,7 @@ provider "aws" {
       iam  = endpoints.value
       sts  = endpoints.value
       logs = endpoints.value
+      kms  = endpoints.value
     }
   }
 }

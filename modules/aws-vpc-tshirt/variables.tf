@@ -31,7 +31,7 @@ variable "delete_default_vpc" {
 
 variable "enable_flow_logs" {
   type        = bool
-  description = "Publish VPC flow logs for all traffic to a CloudWatch log group retained for 90 days."
+  description = "Publish VPC flow logs for all traffic to a KMS-encrypted CloudWatch log group retained for 365 days."
   default     = false
 }
 
