@@ -1,9 +1,10 @@
 # Landing zone pipeline. Plan-only by default.
 # contents: read is enough to check out the repo.
 # id-token: write lets the plan job assume AWS_PLAN_ROLE_ARN with GitHub OIDC.
-# pull-requests: write is set only on the comment job. That job does not check out
-# the pull request, so untrusted code does not run with a token that can comment.
-# No static AWS access keys are stored in this workflow.
+# pull-requests: write is set on terraform-plan-moto, which comments its plan
+# on pull requests, and on comment-plans for the real-account note. comment-plans
+# does not check out the pull request. The Moto plan script does not receive
+# GITHUB_TOKEN. No static AWS access keys are stored in this workflow.
 name: Landing Zone Pipeline
 
 on:
@@ -233,15 +234,21 @@ jobs:
       # - name: Terraform apply
       #   run: terraform apply -input=false tfplan
 
+  # Nonprod plan against Moto. On pull_request this job updates the sticky
+  # comment <!-- landing-zone-plan -->. workflow_dispatch and push to main
+  # have no pull request, so those runs skip the comment.
   terraform-plan-moto:
     name: terraform-plan-moto
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -255,7 +262,11 @@ jobs:
           terraform_wrapper: false
 
       # Nonprod config, Cloud Custodian's pinned Moto. No AWS secrets. No apply.
+      # GITHUB_TOKEN is cleared so the plan script cannot read or print it.
       - name: Terraform plan against Moto
+        id: moto
+        env:
+          GITHUB_TOKEN: ""
         run: |
           set -o pipefail
           ./scripts/plan-with-c7n-moto.sh 2>&1 | tee "${GITHUB_WORKSPACE}/plan-moto.txt"
@@ -276,6 +287,17 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           overwrite: true
+
+      - name: Comment Moto plan on the pull request
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        env:
+          PLAN_OUTCOME: ${{ steps.moto.outcome }}
+        with:
+          script: |
+            const path = require("path");
+            const { postMotoPlanComment } = require(path.join(process.env.GITHUB_WORKSPACE, "scripts", "moto-plan-comment.js"));
+            await postMotoPlanComment({ github, context, core });
 
   terraform-test:
     name: terraform-test
@@ -302,18 +324,17 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: terraform test
 
-  # Posts plan text captured by the plan jobs. No checkout: the pull request
-  # tree is not on disk, and this token cannot be used by that code.
+  # Real-account plan comment only. The Moto job posts <!-- landing-zone-plan -->.
+  # No checkout: the pull request tree is not on disk, and this token cannot
+  # be used by that code. Pull requests only; push and workflow_dispatch skip it.
   comment-plans:
     name: comment-plans
     needs:
       - aws-credentials-present
       - terraform-plan
-      - terraform-plan-moto
     if: >-
       always() &&
       github.event_name == 'pull_request' &&
-      needs.terraform-plan-moto.result != 'cancelled' &&
       needs.aws-credentials-present.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -321,13 +342,6 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Download Moto plan
-        uses: actions/download-artifact@v8
-        continue-on-error: true
-        with:
-          name: plan-moto
-          path: plans/moto
-
       - name: Download real-account plans
         if: always()
         uses: actions/download-artifact@v8
@@ -340,7 +354,6 @@ jobs:
         if: always()
         uses: actions/github-script@v9
         env:
-          MOTO_RESULT: ${{ needs.terraform-plan-moto.result }}
           REAL_RESULT: ${{ needs.terraform-plan.result }}
           REAL_CONFIGURED: ${{ needs.aws-credentials-present.outputs.configured }}
           REAL_MODE: ${{ needs.aws-credentials-present.outputs.mode }}
@@ -352,11 +365,16 @@ jobs:
 
             const MAX_PLAN = 60000;
             const MAX_COMMENT = 65000;
-            const MOTO_MARKER = "<!-- landing-zone-plan -->";
             const REAL_MARKER = "<!-- landing-zone-plan-real -->";
 
-            function redact(text) {
+            function stripAnsi(text) {
               return String(text)
+                .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+                .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "");
+            }
+
+            function redact(text) {
+              return stripAnsi(text)
                 .replace(/\u0000/g, "")
                 .replace(/\b(AKIA|ASIA|AROA|AIDA)[0-9A-Z]{16}\b/g, "[redacted]")
                 .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
@@ -406,15 +424,25 @@ jobs:
               }
             }
 
+            function planSummaryLine(text) {
+              const plan = text.match(/^Plan:\s+\d+\s+to add,\s+\d+\s+to change,\s+\d+\s+to destroy\.?\s*$/m);
+              if (plan) return plan[0].trim();
+              const none = text.match(/^No changes\..+$/m);
+              if (none) return none[0].trim();
+              return "";
+            }
+
             function sectionsUnder(dir) {
               if (!fs.existsSync(dir)) return [];
               const files = [];
               walkTxt(dir, files);
               files.sort();
               return files.map((file) => {
-                const raw = fs.readFileSync(file, "utf8").slice(0, 80000);
+                const raw = stripAnsi(fs.readFileSync(file, "utf8").slice(0, 80000));
+                const name = path.basename(file, ".txt");
+                const summaryLine = planSummaryLine(raw);
                 return {
-                  summary: path.basename(file, ".txt"),
+                  summary: summaryLine ? `${name}: ${summaryLine}` : name,
                   body: raw.trim() ? raw : "(no output)",
                 };
               });
@@ -468,29 +496,12 @@ jobs:
               console.log(`Created comment ${created.data.id} for ${marker}`);
             }
 
-            const motoResult = process.env.MOTO_RESULT || "unknown";
             const realResult = process.env.REAL_RESULT || "unknown";
             const configured = process.env.REAL_CONFIGURED || "";
             const mode = process.env.REAL_MODE || "";
             const credentialsResult = process.env.CREDENTIALS_RESULT || "unknown";
             const secretsUnset = configured === "false" || mode === "unset";
             const realSkipped = realResult === "skipped";
-
-            const motoSections = sectionsUnder("plans/moto");
-            let motoHeader =
-              "## Terraform plan (Moto)\n\n" +
-              "Job `terraform-plan-moto` ran `./scripts/plan-with-c7n-moto.sh` " +
-              `(result: \`${motoResult}\`). This plan does not use AWS secrets.`;
-            if (motoSections.length === 0) {
-              motoHeader += "\n\nMoto plan output was not uploaded.";
-            }
-            if (realSkipped && secretsUnset) {
-              motoHeader += "\n\nReal-account plan was skipped because AWS plan secrets are unset.";
-            } else if (realSkipped) {
-              motoHeader += "\n\nReal-account plan was skipped.";
-            } else {
-              motoHeader += "\n\nThe real-account plan is in a separate comment.";
-            }
 
             let realHeader = "## Terraform plan (real AWS account)\n\n";
             let realSections = [];
@@ -521,5 +532,4 @@ jobs:
               per_page: 100,
             });
 
-            await upsert(comments, MOTO_MARKER, render(MOTO_MARKER, motoHeader, motoSections));
             await upsert(comments, REAL_MARKER, render(REAL_MARKER, realHeader, realSections));
