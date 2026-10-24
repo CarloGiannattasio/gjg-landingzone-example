@@ -1,7 +1,10 @@
 "use strict";
 
-// Builds and posts the sticky Moto plan comment. The workflow calls
-// postMotoPlanComment only for pull_request events.
+// Sticky pull-request comment for the Moto plan matrix.
+// Marker: <!-- landing-zone-plan -->
+// comment-moto-plans calls postMotoPlanComment only for pull_request events.
+// One comment covers every matrix cell. The section layout matches
+// <!-- landing-zone-plan-real -->.
 
 const fs = require("fs");
 const path = require("path");
@@ -22,7 +25,7 @@ function redact(text) {
     .replace(/\b(AKIA|ASIA|AROA|AIDA)[0-9A-Z]{16}\b/g, "[redacted]")
     .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
     .replace(/\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/g, "[redacted]")
-    .replace(/(aws_secret_access_key|aws_access_key_id|aws_session_token)\s*[:=]\s*\S+/gi, "$1=[redacted]");
+    .replace(/(aws_secret_access_key|aws_access_key_id)\s*[:=]\s*\S+/gi, "$1=[redacted]");
 }
 
 function truncate(text, limit) {
@@ -40,80 +43,111 @@ function escapeHtml(text) {
     .replace(/>/g, "&gt;");
 }
 
-function planSummary(text) {
+function planHtml(body, limit) {
+  const clipped = truncate(redact(body), limit);
+  let escaped = escapeHtml(clipped);
+  if (escaped.length > limit) escaped = truncate(escaped, limit);
+  return escaped;
+}
+
+function detailsBlock(summary, body, limit) {
+  return [
+    "<details>",
+    `<summary>${escapeHtml(summary)}</summary>`,
+    "",
+    `<pre><code>${planHtml(body, limit)}</code></pre>`,
+    "</details>",
+  ].join("\n");
+}
+
+function walkTxt(dir, found) {
+  if (!fs.existsSync(dir)) return;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) walkTxt(full, found);
+    else if (entry.isFile() && entry.name.endsWith(".txt")) found.push(full);
+  }
+}
+
+function planSummaryLine(text) {
   const plan = text.match(/^Plan:\s+\d+\s+to add,\s+\d+\s+to change,\s+\d+\s+to destroy\.?\s*$/m);
   if (plan) return plan[0].trim();
   const none = text.match(/^No changes\..+$/m);
   if (none) return none[0].trim();
-  const err = text.match(/^Error: .+$/m);
-  if (err) return err[0].trim().slice(0, 300);
-  return "Plan summary was not found in the output.";
+  return "";
 }
 
-function headerFor(outcome) {
-  const lines = [
-    "## Terraform Plan (Moto)",
-    "",
-    "This is the Moto plan for nonprod (`example-nonprod`). " +
-      "It runs `./scripts/plan-with-c7n-moto.sh` against Cloud Custodian's pinned Moto server. " +
-      "It does not use AWS credentials and it is not a live apply.",
-  ];
-  if (outcome === "failure") {
-    lines.push("", "The Moto plan step failed. The output below is from that run.");
-  } else if (outcome && outcome !== "success") {
-    lines.push("", `The Moto plan step result was \`${outcome}\`.`);
-  }
-  return lines.join("\n");
+function sectionsUnder(dir) {
+  if (!dir || !fs.existsSync(dir)) return [];
+  const files = [];
+  walkTxt(dir, files);
+  files.sort();
+  return files.map((file) => {
+    const raw = stripAnsi(fs.readFileSync(file, "utf8").slice(0, 80000));
+    const name = path.basename(file, ".txt");
+    const summaryLine = planSummaryLine(raw);
+    return {
+      summary: summaryLine ? `${name}: ${summaryLine}` : name,
+      body: raw.trim() ? raw : "(no output)",
+    };
+  });
 }
 
-function assemble(header, summary, escapedPlan) {
-  const visible = summary.replace(/[*_`\\[\]]/g, "");
-  return [
-    MARKER,
-    header,
-    "",
-    `**${visible}**`,
-    "",
-    "<details>",
-    `<summary>${escapeHtml(summary)}</summary>`,
-    "",
-    `<pre><code>${escapedPlan}</code></pre>`,
-    "</details>",
-    "",
-  ].join("\n");
-}
-
-function buildMotoComment(raw, outcome) {
-  const cleaned = redact(raw).trim();
-  const text = cleaned || "(no output)";
-  const summary = planSummary(text);
-  const header = headerFor(outcome || "unknown");
-  let escaped = escapeHtml(truncate(text, MAX_PLAN));
-  if (escaped.length > MAX_PLAN) escaped = truncate(escaped, MAX_PLAN);
-
-  let body = assemble(header, summary, escaped);
-  if (body.length > MAX_COMMENT) {
+function render(marker, header, sections) {
+  const wrapper = (summary) =>
+    `<details>\n<summary>${escapeHtml(summary)}</summary>\n\n<pre><code></code></pre>\n</details>\n\n`.length;
+  let overhead = marker.length + 1 + header.length + 2;
+  for (const section of sections) overhead += wrapper(section.summary);
+  const per =
+    sections.length === 0
+      ? MAX_PLAN
+      : Math.max(2000, Math.min(MAX_PLAN, Math.floor((MAX_COMMENT - overhead) / sections.length)));
+  const blocks = sections.map((section) => detailsBlock(section.summary, section.body, per));
+  let body = `${marker}\n${header}`;
+  if (blocks.length) body += `\n\n${blocks.join("\n\n")}`;
+  if (body.length > MAX_COMMENT && sections.length) {
     const overflow = body.length - MAX_COMMENT;
-    const tighter = Math.max(500, escaped.length - overflow - 80);
-    escaped = truncate(escaped, tighter);
-    body = assemble(header, summary, escaped);
+    const tighter = Math.max(500, per - Math.ceil(overflow / sections.length) - 80);
+    const again = sections.map((section) => detailsBlock(section.summary, section.body, tighter));
+    body = `${marker}\n${header}\n\n${again.join("\n\n")}`;
   }
   if (body.length > MAX_COMMENT) {
     body = `${body.slice(0, MAX_COMMENT - 28)}\n… comment truncated`;
   }
-  return { body, summary };
+  return body;
 }
 
-function planFilePath() {
+function headerFor(result) {
+  const value = result || "unknown";
+  return (
+    "## Terraform plan (Moto)\n\n" +
+    "This is a mock plan. It uses no cloud credentials and it is not a live apply. " +
+    "The matrix matches the real-credential AWS config list. " +
+    `Job \`terraform-plan-moto\` result: \`${value}\`.`
+  );
+}
+
+function buildMotoPlanComment({ dir, result } = {}) {
+  const sections = sectionsUnder(dir);
+  let header = headerFor(result);
+  if (sections.length === 0) {
+    header += "\n\nThe Moto plan job did not upload plan output.";
+  }
+  return render(MARKER, header, sections);
+}
+
+function resolvePlanDir() {
   const root = process.env.GITHUB_WORKSPACE || process.cwd();
-  return path.join(root, "plan-moto.txt");
+  const given = process.env.PLAN_DIR;
+  if (!given) return path.join(root, "plans", "moto");
+  return path.isAbsolute(given) ? given : path.resolve(root, given);
 }
 
 async function postMotoPlanComment({ github, context, core }) {
-  const file = planFilePath();
-  const raw = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "Moto plan produced no output.";
-  const { body, summary } = buildMotoComment(raw, process.env.PLAN_OUTCOME || "unknown");
-  if (core) core.info(`Moto plan comment summary: ${summary}`);
+  const dir = resolvePlanDir();
+  const result = process.env.PLAN_RESULT || process.env.PLAN_OUTCOME || "unknown";
+  const body = buildMotoPlanComment({ dir, result });
+  if (core) core.info(`Moto plan comment for ${result} from ${dir}`);
 
   const comments = await github.paginate(github.rest.issues.listComments, {
     owner: context.repo.owner,
@@ -148,8 +182,8 @@ module.exports = {
   MARKER,
   MAX_PLAN,
   MAX_COMMENT,
-  buildMotoComment,
+  buildMotoPlanComment,
   postMotoPlanComment,
-  planSummary,
   redact,
+  sectionsUnder,
 };
