@@ -9,7 +9,10 @@
 #
 # Does not run terraform apply.
 # Optional first argument: config_path relative to the root module.
-# Default: example-nonprod (Small VPC, flow logs off).
+# Default: example-nonprod (Small VPC, flow logs off). CI passes each
+# real-credential AWS config path and does not rely on that default.
+# Optional second argument: gcp_config_path relative to the root module.
+# When omitted, the root module default GCP project file is used.
 
 set -euo pipefail
 
@@ -17,6 +20,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 CONFIG_PATH="${1:-../config/aws/example/example-nonprod/example-nonprod.json}"
+GCP_CONFIG_PATH="${2:-}"
 TF="${TERRAFORM_BIN:-terraform}"
 
 if [[ ! -d "$ROOT/.venv" ]]; then
@@ -190,10 +194,21 @@ unset GOOGLE_APPLICATION_CREDENTIALS GOOGLE_CREDENTIALS GOOGLE_OAUTH_ACCESS_TOKE
   GOOGLE_CLOUD_KEYFILE_JSON CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE
 
 echo "Planning against Cloud Custodian's pinned Moto (${ENDPOINT}) and loopback Compute (${GCP_ENDPOINT})"
+echo "config_path=${CONFIG_PATH}"
 "$TF" -chdir=root init -backend=false -input=false -no-color
-"$TF" -chdir=root plan -input=false -no-color \
-  -var="config_path=${CONFIG_PATH}" \
-  -var="aws_endpoint_url=${ENDPOINT}" \
+plan_args=(
+  -chdir=root
+  plan
+  -input=false
+  -no-color
+  -var="config_path=${CONFIG_PATH}"
+  -var="aws_endpoint_url=${ENDPOINT}"
   -var="gcp_endpoint_url=${GCP_ENDPOINT}"
+)
+if [[ -n "${GCP_CONFIG_PATH}" ]]; then
+  echo "gcp_config_path=${GCP_CONFIG_PATH}"
+  plan_args+=(-var="gcp_config_path=${GCP_CONFIG_PATH}")
+fi
+"$TF" "${plan_args[@]}"
 
 rm -f "$LOG_FILE"

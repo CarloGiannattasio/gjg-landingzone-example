@@ -1,10 +1,11 @@
 # Landing zone pipeline. Plan-only by default.
 # contents: read is enough to check out the repo.
 # id-token: write lets the plan job assume AWS_PLAN_ROLE_ARN with GitHub OIDC.
-# pull-requests: write is set on the jobs that comment: terraform-plan-moto,
-# terraform-plan-gcp-mock, comment-plans, and comment-gcp-plan.
+# pull-requests: write is set on the jobs that comment: comment-moto-plans,
+# comment-gcp-mock, comment-plans, and comment-gcp-plan.
 # comment-plans and comment-gcp-plan do not check out the pull request.
-# Plan scripts do not receive GITHUB_TOKEN.
+# comment-moto-plans and comment-gcp-mock check out only to load the comment
+# helper. Plan scripts do not receive GITHUB_TOKEN.
 # No static AWS or GCP keys are stored in this workflow.
 name: Landing Zone Pipeline
 
@@ -24,6 +25,9 @@ permissions:
 env:
   TF_IN_AUTOMATION: "true"
   TF_VERSION: "1.9.8"
+  # Root plans AWS and GCP together. The real GCP job and the GCP mock both
+  # pass this AWS account file plus each path in the GCP config list.
+  GCP_PLAN_AWS_CONFIG: ../config/aws/example/example-prod/example-prod.json
 
 jobs:
   lint-and-scan:
@@ -162,7 +166,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        config_path:
+        # Mock job terraform-plan-moto aliases this list. Add an account file here only.
+        config_path: &aws_config_paths
           - ../config/aws/example/example-prod/example-prod.json
           - ../config/aws/example/example-nonprod/example-nonprod.json
           - ../config/aws/example/example-preprod/example-preprod.json
@@ -252,16 +257,19 @@ jobs:
       # - name: Terraform apply
       #   run: terraform apply -input=false tfplan
 
-  # Nonprod plan against Moto. On pull_request this job updates the sticky
-  # comment <!-- landing-zone-plan -->. workflow_dispatch and push to main
-  # have no pull request, so those runs skip the comment.
+  # Mock plan of the same AWS account files as terraform-plan. No AWS or GCP
+  # secrets. Does not comment. On pull_request, comment-moto-plans posts
+  # <!-- landing-zone-plan -->. Push to main and workflow_dispatch still plan.
   terraform-plan-moto:
     name: terraform-plan-moto
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
-      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        config_path: *aws_config_paths
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -279,38 +287,72 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      # Nonprod config, Cloud Custodian's pinned Moto. No AWS secrets. No apply.
+      # Cell config, Cloud Custodian's pinned Moto, and the loopback Compute
+      # stub because root includes the Google provider. No secrets. No apply.
       # GITHUB_TOKEN is cleared so the plan script cannot read or print it.
       - name: Terraform plan against Moto
-        id: moto
         env:
           GITHUB_TOKEN: ""
         run: |
           set -o pipefail
-          ./scripts/plan-with-c7n-moto.sh 2>&1 | tee "${GITHUB_WORKSPACE}/plan-moto.txt"
+          base=$(basename "${{ matrix.config_path }}" .json)
+          mkdir -p "${GITHUB_WORKSPACE}/moto-plans"
+          ./scripts/plan-with-c7n-moto.sh "${{ matrix.config_path }}" 2>&1 | tee "${GITHUB_WORKSPACE}/moto-plans/${base}.txt"
 
       - name: Ensure Moto plan file exists
         if: always()
         run: |
-          if [ ! -f "${GITHUB_WORKSPACE}/plan-moto.txt" ]; then
-            echo "Moto plan produced no output." > "${GITHUB_WORKSPACE}/plan-moto.txt"
+          base=$(basename "${{ matrix.config_path }}" .json)
+          mkdir -p "${GITHUB_WORKSPACE}/moto-plans"
+          file="${GITHUB_WORKSPACE}/moto-plans/${base}.txt"
+          if [ ! -f "$file" ]; then
+            echo "Moto plan produced no output for ${base}." > "$file"
           fi
 
       - name: Upload Moto plan
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: plan-moto
-          path: plan-moto.txt
+          name: plan-moto-${{ strategy.job-index }}
+          path: ${{ github.workspace }}/moto-plans
           if-no-files-found: error
           retention-days: 7
           overwrite: true
 
-      - name: Comment Moto plan on the pull request
-        if: always() && github.event_name == 'pull_request'
+  # One sticky Moto comment for the whole matrix. Pull requests only.
+  # Push to main and workflow_dispatch do not comment.
+  comment-moto-plans:
+    name: comment-moto-plans
+    needs: terraform-plan-moto
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      needs.terraform-plan-moto.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download Moto plans
+        if: always()
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: plan-moto-*
+          path: plans/moto
+
+      - name: Post or update sticky Moto plan comment
+        if: always()
         uses: actions/github-script@v9
         env:
-          PLAN_OUTCOME: ${{ steps.moto.outcome }}
+          PLAN_RESULT: ${{ needs.terraform-plan-moto.result }}
+          PLAN_DIR: ${{ github.workspace }}/plans/moto
         with:
           script: |
             const path = require("path");
@@ -342,7 +384,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: terraform test
 
-  # Real-account plan comment only. The Moto job posts <!-- landing-zone-plan -->.
+  # Real-account plan comment only. comment-moto-plans posts <!-- landing-zone-plan -->.
   # No checkout: the pull request tree is not on disk, and this token cannot
   # be used by that code. Pull requests only; push and workflow_dispatch skip it.
   comment-plans:
@@ -596,7 +638,8 @@ jobs:
             echo "Real GCP plan skipped (gcp_mode=${gcp_mode}, aws_mode=${aws_mode}). Secret values are not printed."
           fi
 
-  # Real plan of root. Needs GCP and AWS credentials. On pull_request,
+  # Real plan of root for each GCP project file. Needs GCP and AWS credentials,
+  # because one root plan talks to both providers. On pull_request,
   # comment-gcp-plan updates <!-- landing-zone-plan-gcp -->. Apply is not a step.
   terraform-plan-gcp:
     name: terraform-plan (real GCP)
@@ -604,6 +647,12 @@ jobs:
     if: needs.gcp-credentials-present.outputs.configured == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mock job terraform-plan-gcp-mock aliases this list. Add a project file here only.
+        gcp_config_path: &gcp_config_paths
+          - ../config/gcp/example/example-prod/example-prod.json
     defaults:
       run:
         working-directory: root
@@ -654,26 +703,28 @@ jobs:
       - name: Terraform plan
         run: |
           set -o pipefail
+          base=$(basename "${{ matrix.gcp_config_path }}" .json)
           mkdir -p "${GITHUB_WORKSPACE}/gcp-plans"
           terraform plan -input=false -no-color \
-            -var="config_path=../config/aws/example/example-prod/example-prod.json" \
-            -var="gcp_config_path=../config/gcp/example/example-prod/example-prod.json" \
-            -out=tfplan 2>&1 | tee "${GITHUB_WORKSPACE}/gcp-plans/example-prod.txt"
+            -var="config_path=${{ env.GCP_PLAN_AWS_CONFIG }}" \
+            -var="gcp_config_path=${{ matrix.gcp_config_path }}" \
+            -out=tfplan 2>&1 | tee "${GITHUB_WORKSPACE}/gcp-plans/${base}.txt"
 
       - name: Ensure real GCP plan file exists
         if: always()
         run: |
+          base=$(basename "${{ matrix.gcp_config_path }}" .json)
           mkdir -p "${GITHUB_WORKSPACE}/gcp-plans"
-          file="${GITHUB_WORKSPACE}/gcp-plans/example-prod.txt"
+          file="${GITHUB_WORKSPACE}/gcp-plans/${base}.txt"
           if [ ! -f "$file" ]; then
-            echo "Real GCP plan produced no output." > "$file"
+            echo "Real GCP plan produced no output for ${base}." > "$file"
           fi
 
       - name: Upload real GCP plan
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: plan-gcp
+          name: plan-gcp-${{ strategy.job-index }}
           path: ${{ github.workspace }}/gcp-plans
           if-no-files-found: error
           retention-days: 7
@@ -686,16 +737,19 @@ jobs:
       # - name: Terraform apply
       #   run: terraform apply -input=false tfplan
 
-  # Root plan with dummy AWS and GCP credentials. On pull_request this job
-  # updates <!-- landing-zone-plan-gcp-mock -->. workflow_dispatch and push
-  # to main have no pull request, so those runs skip the comment.
+  # Mock plan of the same GCP project files as terraform-plan-gcp. No real
+  # credentials. Does not comment. On pull_request, comment-gcp-mock posts
+  # <!-- landing-zone-plan-gcp-mock -->. Push to main and workflow_dispatch still plan.
   terraform-plan-gcp-mock:
     name: terraform-plan-gcp-mock
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
-      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        gcp_config_path: *gcp_config_paths
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -713,43 +767,79 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
+      # Same AWS account file and GCP project file as the real GCP plan.
+      # Moto plus the loopback Compute stub. No secrets. No apply.
+      # GITHUB_TOKEN is cleared so the plan script cannot read or print it.
       - name: Terraform plan against the GCP mock
-        id: mock
         env:
           GITHUB_TOKEN: ""
         run: |
           set -o pipefail
-          ./scripts/plan-with-gcp-mock.sh 2>&1 | tee "${GITHUB_WORKSPACE}/plan-gcp-mock.txt"
+          base=$(basename "${{ matrix.gcp_config_path }}" .json)
+          mkdir -p "${GITHUB_WORKSPACE}/gcp-mock-plans"
+          ./scripts/plan-with-gcp-mock.sh "${{ env.GCP_PLAN_AWS_CONFIG }}" "${{ matrix.gcp_config_path }}" 2>&1 | tee "${GITHUB_WORKSPACE}/gcp-mock-plans/${base}.txt"
 
       - name: Ensure GCP mock plan file exists
         if: always()
         run: |
-          if [ ! -f "${GITHUB_WORKSPACE}/plan-gcp-mock.txt" ]; then
-            echo "GCP mock plan produced no output." > "${GITHUB_WORKSPACE}/plan-gcp-mock.txt"
+          base=$(basename "${{ matrix.gcp_config_path }}" .json)
+          mkdir -p "${GITHUB_WORKSPACE}/gcp-mock-plans"
+          file="${GITHUB_WORKSPACE}/gcp-mock-plans/${base}.txt"
+          if [ ! -f "$file" ]; then
+            echo "GCP mock plan produced no output for ${base}." > "$file"
           fi
 
       - name: Upload GCP mock plan
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: plan-gcp-mock
-          path: plan-gcp-mock.txt
+          name: plan-gcp-mock-${{ strategy.job-index }}
+          path: ${{ github.workspace }}/gcp-mock-plans
           if-no-files-found: error
           retention-days: 7
           overwrite: true
 
-      - name: Comment GCP mock plan on the pull request
-        if: always() && github.event_name == 'pull_request'
+  # One sticky GCP mock comment for the whole matrix. Pull requests only.
+  # Push to main and workflow_dispatch do not comment.
+  comment-gcp-mock:
+    name: comment-gcp-mock
+    needs: terraform-plan-gcp-mock
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      needs.terraform-plan-gcp-mock.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download GCP mock plans
+        if: always()
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: plan-gcp-mock-*
+          path: plans/gcp-mock
+
+      - name: Post or update sticky GCP mock plan comment
+        if: always()
         uses: actions/github-script@v9
         env:
-          PLAN_OUTCOME: ${{ steps.mock.outcome }}
+          PLAN_RESULT: ${{ needs.terraform-plan-gcp-mock.result }}
+          PLAN_DIR: ${{ github.workspace }}/plans/gcp-mock
         with:
           script: |
             const path = require("path");
             const { postGcpMockPlanComment } = require(path.join(process.env.GITHUB_WORKSPACE, "scripts", "gcp-mock-plan-comment.js"));
             await postGcpMockPlanComment({ github, context, core });
 
-  # Real GCP plan comment only. The mock job posts <!-- landing-zone-plan-gcp-mock -->.
+  # Real GCP plan comment only. comment-gcp-mock posts <!-- landing-zone-plan-gcp-mock -->.
   # No checkout. Pull requests only; push and workflow_dispatch skip it.
   comment-gcp-plan:
     name: comment-gcp-plan
@@ -771,7 +861,8 @@ jobs:
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          pattern: plan-gcp
+          # Digits only, so this does not also download plan-gcp-mock-*.
+          pattern: plan-gcp-[0-9]*
           path: plans/gcp
 
       - name: Post or update sticky GCP plan comment

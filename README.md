@@ -1,6 +1,6 @@
 # gjg-landingzone-example
 
-Enterprise-style multi-cloud landing zone **example** for business unit `example`. One JSON document per account or project is the contract. The Terraform root module decodes those documents and calls shared AWS and GCP modules. Terraform `>= 1.5` (CI pins `1.9.8`). GitHub Actions runs fmt, TFLint, Checkov, a config-contract check, a Moto plan of nonprod, a credential-free GCP mock plan, `terraform test`, a real-account AWS plan when AWS secrets are set, and a real GCP plan of root when both GCP and AWS plan secrets are set. Pull requests get those plans as sticky comments.
+Enterprise-style multi-cloud landing zone **example** for business unit `example`. One JSON document per account or project is the contract. The Terraform root module decodes those documents and calls shared AWS and GCP modules. Terraform `>= 1.5` (CI pins `1.9.8`). GitHub Actions runs fmt, TFLint, Checkov, a config-contract check, a Moto plan of the same AWS account files as the real-credential plan, a credential-free GCP mock plan of the same GCP project list, `terraform test`, a real-account AWS plan when AWS secrets are set, and a real GCP plan of root when both GCP and AWS plan secrets are set. Pull requests get those plans as sticky comments, with one section per config.
 
 The pipeline is **plan-only**. `terraform apply` is commented out in the workflow and cannot run.
 
@@ -49,8 +49,8 @@ The pipeline is **plan-only**. `terraform apply` is commented out in the workflo
 | `tests/vpc_tshirt.tftest.hcl` | `terraform test` with a mocked AWS provider. |
 | `tests/gcp_vpc_tshirt.tftest.hcl` | `terraform test` with a mocked Google provider. |
 | `tests.tf` | Root configuration with no resources, so `terraform init` installs the modules under test. |
-| `scripts/plan-with-c7n-moto.sh` | Local `terraform plan` against Moto and a loopback Compute stub. |
-| `scripts/plan-with-gcp-mock.sh` | Same plan. Dummy AWS and GCP credentials. Compute is loopback; provider init still calls Google userinfo. |
+| `scripts/plan-with-c7n-moto.sh` | Local `terraform plan` against Moto and a loopback Compute stub. The first argument is the AWS config path. |
+| `scripts/plan-with-gcp-mock.sh` | Same mock plan. Forwards the AWS config path and an optional GCP project path. Dummy credentials. Compute is loopback; provider init still calls Google userinfo. |
 | `requirements-dev.txt` | Pins that Moto release (`moto[server]==5.2.3`). |
 
 Every `config/**/*.json` file carries `account_name` or `project_id`, plus `environment`, `business_unit`, `region`, `cost_center`, `mandatory_tags`, and `vpc`. AWS files use `account_name`. The GCP file uses `project_id` (and also sets `account_name`). CI rejects a file that drops any of those keys.
@@ -124,11 +124,13 @@ This is not a substitute for the OIDC plan against real AWS. `tests/vpc_tshirt.t
 ./scripts/plan-with-c7n-moto.sh
 ```
 
-The script plans `config/aws/example/example-nonprod/example-nonprod.json` (Small, flow logs off) and the default GCP project file. Pass another AWS config path, relative to the `root` module, as the first argument. It does not apply. It sets `aws_endpoint_url` and `gcp_endpoint_url`. With both unset, the providers stay on real AWS and real Google.
+With no arguments, the script plans `config/aws/example/example-nonprod/example-nonprod.json` (Small, flow logs off) and the default GCP project file. That default is only for a local run with no arguments. Pass an AWS config path, relative to the `root` module, as the first argument. Pass a GCP project path as the second argument when the plan should not use the default GCP file. It does not apply. It sets `aws_endpoint_url` and `gcp_endpoint_url`. With both unset, the providers stay on real AWS and real Google.
 
-`./scripts/plan-with-gcp-mock.sh` runs that same plan. It does not need real Google or AWS credentials.
+`./scripts/plan-with-gcp-mock.sh` runs that same plan and forwards those arguments. It does not need real Google or AWS credentials.
 
-A plan of the nonprod config against Moto and the loopback Compute stub succeeded: 29 to add, 0 to change, 0 to destroy. Moto answered EC2 `DescribeAvailabilityZones` (`us-east-1a`). The plan includes the AWS VPC, subnets, NAT, default VPC adoption, and the `example-admin` role, plus the GCP network, subnets, Cloud Routers, and Cloud NAT from the example project (Large). Provider init still requests Google userinfo on googleapis.com and continues after a 401 for the dummy token. No Compute request was sent to compute.googleapis.com or to the stub on that empty-state plan. The script does not apply.
+CI does not stop at the no-argument default. The Moto matrix matches the real-credential AWS config list (`example-prod`, `example-nonprod`, and `example-preprod`). The GCP mock matrix matches the real GCP config list (today `config/gcp/example/example-prod/example-prod.json`). Each cell plans that cell's config and does not apply. The pull request comment for each mock has one section per config.
+
+For example, a plan of the nonprod config against Moto and the loopback Compute stub succeeded: 29 to add, 0 to change, 0 to destroy. Moto answered EC2 `DescribeAvailabilityZones` (`us-east-1a`). The plan includes the AWS VPC, subnets, NAT, default VPC adoption, and the `example-admin` role, plus the GCP network, subnets, Cloud Routers, and Cloud NAT from the example project (Large). Provider init still requests Google userinfo on googleapis.com and continues after a 401 for the dummy token. No Compute request was sent to compute.googleapis.com or to the stub on that empty-state plan. The script does not apply.
 
 ## Real account
 
@@ -138,7 +140,7 @@ To point `terraform-plan` at a real account later, add secrets in the GitHub rep
 - Or, if you choose long-lived keys instead of a role: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 - Optional: `AWS_REGION`. When that secret is unset, the credentials step uses `us-east-1`.
 
-If `AWS_PLAN_ROLE_ARN` is set, the job uses OIDC. Otherwise, if both access key secrets are set, the job uses those static keys. If neither is configured, the real-account plan job is skipped and the Moto plan job still runs.
+If `AWS_PLAN_ROLE_ARN` is set, the job uses OIDC. Otherwise, if both access key secrets are set, the job uses those static keys. If neither is configured, the real-account plan job is skipped and the Moto matrix still runs.
 
 The real GCP plan (`terraform-plan (real GCP)`) runs only when both sets of credentials are present, because that plan talks to AWS and GCP:
 
@@ -146,7 +148,7 @@ The real GCP plan (`terraform-plan (real GCP)`) runs only when both sets of cred
 - Or, if you choose a key instead: `GCP_SA_KEY`.
 - And the AWS plan secrets above (`AWS_PLAN_ROLE_ARN`, or both access key secrets).
 
-If only one side is set, the real GCP job is skipped. The pull request comment says which side was missing. Secret values are not printed. The mock plan does not read these secrets.
+If only one side is set, the real GCP job is skipped. The pull request comment says which side was missing. Secret values are not printed. The mock plans do not read these secrets.
 
 The account id `123456789012` in `policies/iam-trust/pipeline-trust.json` is a placeholder in the example trust policy. It is unrelated to these secrets and is still not a live account.
 
@@ -167,7 +169,7 @@ Workflow: `.github/workflows/landing-zone-pipeline.yml` (`Landing Zone Pipeline`
 
 Triggers: push to `main`, pull requests targeting `main`, and manual `workflow_dispatch`.
 
-Permissions at the workflow level are `contents: read` and `id-token: write`. The workflow does not request write-all, and it does not store static AWS or GCP keys. `terraform-plan-moto` and `terraform-plan-gcp-mock` set `contents: read` and `pull-requests: write` so those jobs can comment their plans on pull requests. `comment-plans` and `comment-gcp-plan` use those same two permissions for the real-account comments and do not check out the pull request.
+Permissions at the workflow level are `contents: read` and `id-token: write`. The workflow does not request write-all, and it does not store static AWS or GCP keys. `terraform-plan-moto` and `terraform-plan-gcp-mock` set `contents: read` only. They do not receive AWS or GCP secrets, and they do not comment. `comment-moto-plans` and `comment-gcp-mock` set `contents: read` and `pull-requests: write` so they can post the mock plans on pull requests. `comment-plans` and `comment-gcp-plan` use those same two permissions for the real-credential comments and do not check out the pull request.
 
 | Job | What it does | AWS credentials |
 | --- | --- | --- |
@@ -175,18 +177,20 @@ Permissions at the workflow level are `contents: read` and `id-token: write`. Th
 | `aws-credentials-present` | Checks whether real-account secrets are set. Prints `oidc`, `static`, or `unset`. Does not print secret values. | Reads secret names only |
 | `terraform-plan (real AWS account)` | Skipped when neither `AWS_PLAN_ROLE_ARN` nor both access key secrets are set. Otherwise a matrix of the three AWS account files. Working directory `root`. `terraform init -backend=false`, `terraform validate`, `terraform plan -var=config_path=... -out=tfplan`. OIDC when the role secret is set; static keys only when the role secret is empty and both key secrets are set. Also authenticates to GCP when those secrets are set, because root plans GCP resources too. | OIDC role, or the two key secrets. GCP auth when configured |
 | `gcp-credentials-present` | Checks GCP and AWS plan secrets. Prints `wif`, `sa_key`, or `unset` for GCP and `oidc`, `static`, or `unset` for AWS. Does not print secret values. | Reads secret names only |
-| `terraform-plan (real GCP)` | Skipped unless GCP credentials (`GCP_WORKLOAD_IDENTITY_PROVIDER` + `GCP_SERVICE_ACCOUNT`, or `GCP_SA_KEY`) and AWS plan credentials are both set. Plans `root` for example-prod. No apply. | Both GCP and AWS plan credentials |
-| `terraform-plan-moto` | `./scripts/plan-with-c7n-moto.sh` for the nonprod config, with Moto and a loopback Compute URL. No apply. On pull requests, posts or updates one sticky comment (`<!-- landing-zone-plan -->`). | None |
-| `terraform-plan-gcp-mock` | `./scripts/plan-with-gcp-mock.sh`. Same mock plan. On pull requests, posts or updates `<!-- landing-zone-plan-gcp-mock -->`. | None |
+| `terraform-plan (real GCP)` | Skipped unless GCP credentials (`GCP_WORKLOAD_IDENTITY_PROVIDER` + `GCP_SERVICE_ACCOUNT`, or `GCP_SA_KEY`) and AWS plan credentials are both set. Matrix of the GCP project list (today `config/gcp/example/example-prod/example-prod.json`), the same list as the mock. Also passes the example-prod AWS account file because root plans both providers. No apply. | Both GCP and AWS plan credentials |
+| `terraform-plan-moto` | Matrix of the same three AWS account files as the real plan. `./scripts/plan-with-c7n-moto.sh` with that cell's config path, Moto, and a loopback Compute URL. No secrets. No apply. Does not comment. | None |
+| `terraform-plan-gcp-mock` | Matrix of the same GCP project list as the real GCP plan. `./scripts/plan-with-gcp-mock.sh` with that cell's GCP path and the example-prod AWS account file. No secrets. No apply. Does not comment. | None |
 | `terraform-test` | `terraform init -backend=false`, then `terraform test` from the repo root. | None |
-| `comment-plans` | Pull requests only. Posts or updates the real-account sticky comment (`<!-- landing-zone-plan-real -->`). Says the real plan was skipped when AWS secrets are unset. Does not check out code. | None |
-| `comment-gcp-plan` | Pull requests only. Posts or updates `<!-- landing-zone-plan-gcp -->` with the real GCP plan, or a note that it was skipped and which credential set was missing. Does not check out code. | None |
+| `comment-moto-plans` | Pull requests only. Downloads every Moto plan artifact and posts or updates one sticky comment (`<!-- landing-zone-plan -->`) with one section per config. | None |
+| `comment-gcp-mock` | Pull requests only. Downloads every GCP mock artifact and posts or updates one sticky comment (`<!-- landing-zone-plan-gcp-mock -->`) with one section per config. | None |
+| `comment-plans` | Pull requests only. Posts or updates the real-account sticky comment (`<!-- landing-zone-plan-real -->`) with one section per config. Says the real plan was skipped when AWS secrets are unset. Does not check out code. | None |
+| `comment-gcp-plan` | Pull requests only. Posts or updates `<!-- landing-zone-plan-gcp -->` with one section per config, or a note that the real GCP plan was skipped and which credential set was missing. Does not check out code. | None |
 
 `terraform apply -input=false tfplan` is present only as a YAML comment on the real AWS plan job and the real GCP plan job. GitHub Actions does not parse it, so apply is not a step and cannot run. Promoting a plan to apply would be a separate, reviewed change.
 
-On a pull request, `terraform-plan-moto` updates `<!-- landing-zone-plan -->` with the Moto plan for nonprod. `terraform-plan-gcp-mock` updates `<!-- landing-zone-plan-gcp-mock -->` with the mock plan. Those comments state that the run does not use cloud credentials and is not a live apply. The plan summary line (for example `Plan: N to add`) is visible, and the plan text is in a collapsed details block, truncated near 60k characters. `comment-plans` updates `<!-- landing-zone-plan-real -->`. `comment-gcp-plan` updates `<!-- landing-zone-plan-gcp -->` with the real plan, or a note that it was skipped. Secret values are not printed. Pushes to `main` and manual `workflow_dispatch` runs do not comment, because those events are not pull requests.
+On a pull request, `comment-moto-plans` updates `<!-- landing-zone-plan -->` and `comment-gcp-mock` updates `<!-- landing-zone-plan-gcp-mock -->`. Each mock matrix matches the real-credential config list, and each comment has one section per config. Those comments state that the run is a mock plan, uses no cloud credentials, and is not a live apply. The section summary shows the config name and the plan summary line (for example `Plan: N to add`) when that line is present, and the plan text is in a collapsed details block, truncated near 60k characters. `comment-plans` updates `<!-- landing-zone-plan-real -->`. `comment-gcp-plan` updates `<!-- landing-zone-plan-gcp -->` with the real plan, or a note that it was skipped. Secret values are not printed. Pushes to `main` and manual `workflow_dispatch` runs still plan and do not comment, because those events are not pull requests.
 
-`.github/CODEOWNERS` names `@CarloGiannattasio` as the owner of every path. Merges to `main` are meant to require that code owner's approval, dismiss stale approvals, block force pushes and deletions, and require `lint-and-scan`, `terraform-test`, `terraform-plan-moto`, and `real-account credentials check`. `terraform-plan (real AWS account)` is not required, because that job is skipped when secrets are unset and a skipped required check would block merges. Admin bypass stays available so the code owner is not locked out of a pull request they opened. Everyone else still needs that code-owner approval.
+`.github/CODEOWNERS` names `@CarloGiannattasio` as the owner of every path. Merges to `main` are meant to require that code owner's approval, dismiss stale approvals, block force pushes and deletions, and require `lint-and-scan`, `terraform-test`, `terraform-plan-moto`, and `real-account credentials check`. `terraform-plan-moto` is a matrix, so each AWS account file is its own check. `terraform-plan (real AWS account)` is not required, because that job is skipped when secrets are unset and a skipped required check would block merges. Admin bypass stays available so the code owner is not locked out of a pull request they opened. Everyone else still needs that code-owner approval.
 
 Those rules are not enforced yet. Branch protection and repository rulesets both returned HTTP 403: `Upgrade to GitHub Pro or make this repository public to enable this feature.` The repository is private, and making it public was not used as a workaround. Apply the settings above once GitHub Pro (or a public repository) is available, and leave "Do not allow bypassing the above settings" unchecked.
 
