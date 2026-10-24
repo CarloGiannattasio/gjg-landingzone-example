@@ -1,6 +1,6 @@
 # gjg-landingzone-example
 
-Enterprise-style multi-cloud landing zone **example** for business unit `example`. One JSON document per account or project is the contract. The Terraform root module decodes that document and calls shared AWS modules. Terraform `>= 1.5` (CI pins `1.9.8`). GitHub Actions runs fmt, TFLint, Checkov, a config-contract check, a Moto plan of nonprod, `terraform test`, and a real-account plan for each AWS config when repository secrets are set.
+Enterprise-style multi-cloud landing zone **example** for business unit `example`. One JSON document per account or project is the contract. The Terraform root module decodes that document and calls shared AWS modules. Terraform `>= 1.5` (CI pins `1.9.8`). GitHub Actions runs fmt, TFLint, Checkov, a config-contract check, a Moto plan of nonprod, `terraform test`, and a real-account plan for each AWS config when repository secrets are set. Pull requests get those plans as sticky comments.
 
 The pipeline is **plan-only**. `terraform apply` is commented out in the workflow and cannot run.
 
@@ -9,6 +9,7 @@ The pipeline is **plan-only**. `terraform apply` is commented out in the workflo
 ```
 .
 ├── .github/workflows/landing-zone-pipeline.yml
+├── .github/CODEOWNERS
 ├── .tflint.hcl
 ├── requirements-dev.txt
 ├── scripts/plan-with-c7n-moto.sh
@@ -144,7 +145,7 @@ Workflow: `.github/workflows/landing-zone-pipeline.yml` (`Landing Zone Pipeline`
 
 Triggers: push to `main`, and pull requests targeting `main`.
 
-Permissions are `contents: read` and `id-token: write`. The workflow does not request write-all, and it does not store static AWS keys. The Moto job narrows itself to `contents: read`.
+Permissions at the workflow level are `contents: read` and `id-token: write`. The workflow does not request write-all, and it does not store static AWS keys. The Moto job narrows itself to `contents: read`. The comment job replaces that set with `contents: read` and `pull-requests: write`, and it does not check out the pull request.
 
 | Job | What it does | AWS credentials |
 | --- | --- | --- |
@@ -153,8 +154,15 @@ Permissions are `contents: read` and `id-token: write`. The workflow does not re
 | `terraform-plan (real AWS account)` | Skipped when neither `AWS_PLAN_ROLE_ARN` nor both access key secrets are set. Otherwise a matrix of the three AWS account files. Working directory `root`. `terraform init -backend=false`, `terraform validate`, `terraform plan -var=config_path=... -out=tfplan`. OIDC when the role secret is set; static keys only when the role secret is empty and both key secrets are set. | OIDC role, or the two key secrets |
 | `terraform-plan-moto` | `./scripts/plan-with-c7n-moto.sh` for the nonprod config. No apply. | None |
 | `terraform-test` | `terraform init -backend=false`, then `terraform test` from the repo root. | None |
+| `comment-plans` | Pull requests only. Updates two sticky comments instead of posting a new one on every push. Does not check out code; it reads plan artifacts from the jobs above. | None |
 
 `terraform apply -input=false tfplan` is present only as a YAML comment on the plan job. GitHub Actions does not parse it, so apply is not a step and cannot run. Promoting a plan to apply would be a separate, reviewed change.
+
+On a pull request, `<!-- landing-zone-plan -->` is the Moto plan (`terraform-plan-moto` / `./scripts/plan-with-c7n-moto.sh`). `<!-- landing-zone-plan-real -->` is the real-account plan, or a note that the real-account plan was skipped when AWS secrets are unset. Each plan is in a collapsed details block. Plan text is truncated so the comment stays under GitHub's size limit, and secret values are not printed.
+
+`.github/CODEOWNERS` names `@CarloGiannattasio` as the owner of every path. Merges to `main` are meant to require that code owner's approval, dismiss stale approvals, block force pushes and deletions, and require `lint-and-scan`, `terraform-test`, `terraform-plan-moto`, and `real-account credentials check`. `terraform-plan (real AWS account)` is not required, because that job is skipped when secrets are unset and a skipped required check would block merges. Admin bypass stays available so the code owner is not locked out of a pull request they opened. Everyone else still needs that code-owner approval.
+
+Those rules are not enforced yet. Branch protection and repository rulesets both returned HTTP 403: `Upgrade to GitHub Pro or make this repository public to enable this feature.` The repository is private, and making it public was not used as a workaround. Apply the settings above once GitHub Pro (or a public repository) is available, and leave "Do not allow bypassing the above settings" unchecked.
 
 ## CIS-oriented choices
 
